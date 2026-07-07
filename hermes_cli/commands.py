@@ -669,27 +669,26 @@ def _telegram_effective_priority() -> tuple[str, ...]:
     return _dedupe_sanitized_names(raw_priority)
 
 
+def _telegram_priority_index(raw_name: str) -> tuple[int, int | str]:
+    """Return sort key for configured Telegram command priority."""
+    name = _sanitize_telegram_name(str(raw_name).lstrip("/"))
+    priority = {
+        item: index
+        for index, item in enumerate(_telegram_effective_priority())
+    }
+    if name in priority:
+        return (0, priority[name])
+    return (1, name)
+
+
 def _prioritize_telegram_menu_commands(
     commands: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
-    priority = {
-        name: index
-        for index, name in enumerate(_telegram_effective_priority())
-    }
     return [
         command
         for _index, command in sorted(
             enumerate(commands),
-            key=lambda item: (
-                0,
-                priority[item[1][0]],
-                item[0],
-            )
-            if item[1][0] in priority
-            else (
-                1,
-                item[0],
-            ),
+            key=lambda item: (*_telegram_priority_index(item[1][0]), item[0]),
         )
     ]
 
@@ -874,6 +873,12 @@ def _collect_gateway_skill_entries(
             skill_triples.append((name, desc, cmd_key))
     except Exception:
         pass
+
+    # Configured Telegram menu priority applies to skills too, so high-value
+    # local skills survive alphabetical overflow when the BotCommand menu is
+    # capped below the full skill set.
+    if sanitize_name is _sanitize_telegram_name:
+        skill_triples.sort(key=lambda item: _telegram_priority_index(item[0]))
 
     # Clamp names; cmd_key is passed through as extra payload so it survives
     # any clamp-induced renames.

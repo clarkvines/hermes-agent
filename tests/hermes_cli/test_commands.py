@@ -1334,6 +1334,55 @@ class TestTelegramMenuCommands:
 
         assert names[:2] == ["status", "help"]
 
+    def test_configured_priority_keeps_local_skills_before_alphabetic_overflow(self, tmp_path, monkeypatch):
+        """Configured Telegram priorities also sort skill commands before overflow trimming."""
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        fake_cmds = {
+            f"/aaa-filler-{idx:02d}": {
+                "name": f"aaa-filler-{idx:02d}",
+                "description": "Alphabetically early filler",
+                "skill_md_path": f"{skills_dir}/aaa-filler-{idx:02d}/SKILL.md",
+                "skill_dir": f"{skills_dir}/aaa-filler-{idx:02d}",
+            }
+            for idx in range(80)
+        }
+        for name in ("supergoal", "wrapup", "notebooklm", "p-search"):
+            fake_cmds[f"/{name}"] = {
+                "name": name,
+                "description": f"{name} skill",
+                "skill_md_path": f"{skills_dir}/{name}/SKILL.md",
+                "skill_dir": f"{skills_dir}/{name}",
+            }
+
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        priority:\n"
+            "          - supergoal\n"
+            "          - wrapup\n"
+            "          - notebooklm\n"
+            "          - p-search\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=56)
+
+        names = {n for n, _ in menu}
+        assert hidden > 0
+        assert "supergoal" in names
+        assert "wrapup" in names
+        assert "notebooklm" in names
+        assert "p_search" in names
+
     def test_telegram_menu_max_commands_uses_config_with_safe_bounds(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
