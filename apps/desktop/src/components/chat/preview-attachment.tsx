@@ -45,6 +45,64 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     setOpening(false)
   }, [cwd, target])
 
+  async function resolvePreviewTarget(requestTarget: string, requestCwd: string | null) {
+    const preview = await normalizeOrLocalPreviewTarget(requestTarget, requestCwd || undefined)
+
+    if (!preview) {
+      throw new Error(`Could not open preview target: ${requestTarget}`)
+    }
+
+    return preview
+  }
+
+  async function openInBrowser() {
+    if (opening) {
+      return
+    }
+
+    const requestToken = ++requestTokenRef.current
+    const requestTarget = target
+    const requestCwd = cwd
+
+    setOpening(true)
+
+    try {
+      const bridge = window.hermesDesktop?.openPreviewInBrowser
+
+      if (!bridge) {
+        throw new Error('Desktop preview browser bridge is unavailable')
+      }
+
+      const preview = await resolvePreviewTarget(requestTarget, requestCwd)
+
+      if (
+        !mountedRef.current ||
+        requestTokenRef.current !== requestToken ||
+        targetRef.current !== requestTarget ||
+        cwdRef.current !== requestCwd
+      ) {
+        return
+      }
+
+      await bridge(preview.url)
+    } catch (error) {
+      if (
+        !mountedRef.current ||
+        requestTokenRef.current !== requestToken ||
+        targetRef.current !== requestTarget ||
+        cwdRef.current !== requestCwd
+      ) {
+        return
+      }
+
+      notifyError(error, t.preview.unavailable)
+    } finally {
+      if (mountedRef.current && requestTokenRef.current === requestToken) {
+        setOpening(false)
+      }
+    }
+  }
+
   async function togglePreview() {
     if (opening) {
       return
@@ -63,7 +121,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     setOpening(true)
 
     try {
-      const preview = await normalizeOrLocalPreviewTarget(requestTarget, requestCwd || undefined)
+      const preview = await resolvePreviewTarget(requestTarget, requestCwd)
 
       if (
         !mountedRef.current ||
@@ -72,10 +130,6 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         cwdRef.current !== requestCwd
       ) {
         return
-      }
-
-      if (!preview) {
-        throw new Error(`Could not open preview target: ${requestTarget}`)
       }
 
       const currentPreview = activePreviewRef.current
@@ -111,6 +165,14 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
       <span className="min-w-0 flex-1 truncate text-[0.78rem] font-medium text-foreground/90" title={target}>
         {name}
       </span>
+      <button
+        className="shrink-0 rounded-md border border-border/55 bg-background/40 px-2 py-1 text-[0.7rem] font-medium text-muted-foreground transition-colors hover:bg-accent/55 hover:text-foreground disabled:opacity-50"
+        disabled={opening}
+        onClick={() => void openInBrowser()}
+        type="button"
+      >
+        {t.preview.openInBrowser}
+      </button>
       <button
         className="shrink-0 rounded-md border border-border/55 bg-background/40 px-2 py-1 text-[0.7rem] font-medium text-muted-foreground transition-colors hover:bg-accent/55 hover:text-foreground disabled:opacity-50"
         disabled={opening}

@@ -3064,9 +3064,10 @@ class AIAgent:
             return ""
         lines = [
             "⚠️ File-mutation verifier: "
-            f"{len(failed)} file(s) were NOT modified this turn despite any "
-            "wording above that may suggest otherwise. Run `git status` or "
-            "`read_file` to confirm."
+            f"{len(failed)} write_file/patch target path(s) had a failed "
+            "mutation attempt that was not later confirmed successful by "
+            "those same file tools. If another tool (terminal/execute_code) "
+            "edited a path afterward, verify with `git status` or `read_file`."
         ]
         shown = 0
         for path, info in failed.items():
