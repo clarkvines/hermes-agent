@@ -117,6 +117,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
+    CommandDef("supergoal", "Set a standing goal with a 40-turn budget (default)", "Session",
+               args_hint="[[--turns N] text | draft <text> | show | pause | resume | clear | status | wait <pid> | unwait]"),
     CommandDef("status", "Show session, model, token, and context info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
@@ -573,6 +575,9 @@ _TELEGRAM_MENU_PRIORITY = (
     "queue",
     "steer",
     "background",
+    # Goal-mode commands — high-value, must survive menu caps.
+    "goal",
+    "supergoal",
     # Lower-priority but still useful operational built-ins.
     "reasoning",
     "usage",
@@ -1169,7 +1174,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug"})
+#   - supergoal: persistent goal-mode command; Slack is at the 50-slash ceiling,
+#     so power-users reach it via /hermes supergoal; native elsewhere.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "supergoal"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -2034,6 +2041,8 @@ class SlashCommandCompleter(Completer):
                 )
 
         for cmd, info in self._iter_skill_commands().items():
+            if cmd in COMMANDS:
+                continue
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
                 description = str(info.get("description", "Skill command"))

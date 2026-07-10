@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+DEFAULT_SUPERGOAL_MAX_TURNS = 40
+_SUPERGOAL_BUDGET_MIN = 1
+_SUPERGOAL_BUDGET_MAX = 200
+
+# Flag spellings accepted by parse_supergoal_args for the optional turn budget.
+_SUPERGOAL_TURN_FLAGS: frozenset = frozenset(
+    {"--turns", "--max-turns", "-t", "turns", "max-turns"}
+)
+
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
@@ -329,6 +338,107 @@ class GoalContract:
             if val:
                 lines.append(f"- {_CONTRACT_LABELS[f]}: {val}")
         return "\n".join(lines)
+
+
+def _validate_supergoal_budget(val_str: str) -> Optional[str]:
+    """Return a human-readable error string if val_str is not a valid budget, else None."""
+    try:
+        val = int(val_str)
+    except (ValueError, TypeError):
+        return f"invalid budget {val_str!r}: must be an integer"
+    if not (_SUPERGOAL_BUDGET_MIN <= val <= _SUPERGOAL_BUDGET_MAX):
+        return (
+            f"budget {val} is out of range "
+            f"({_SUPERGOAL_BUDGET_MIN}–{_SUPERGOAL_BUDGET_MAX})"
+        )
+    return None
+
+
+def parse_supergoal_args(raw: str) -> Tuple[str, int, Optional[str]]:
+    """Parse /supergoal argument string.
+
+    Returns ``(goal_text, max_turns, error_msg)`` where ``error_msg`` is
+    ``None`` on success or a human-readable error string on invalid budget.
+
+    Accepted budget forms (must appear before the goal text):
+
+      ``/supergoal 80 objective``            positional integer
+      ``/supergoal --turns 80 objective``    long flag + space
+      ``/supergoal --turns=80 objective``    long flag + equals
+      Aliases: ``--max-turns``, ``-t``, ``turns``, ``max-turns``
+
+    Budget defaults to :data:`DEFAULT_SUPERGOAL_MAX_TURNS` when omitted.
+    Budget must be an integer in 1–200; returns a non-None error_msg otherwise.
+
+    A bare integer with no following objective (for example,
+    ``/supergoal 80``) is rejected as a missing-objective mistake.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "", DEFAULT_SUPERGOAL_MAX_TURNS, None
+
+    head_parts = raw.split(None, 1)
+    first = head_parts[0]
+    remainder = (head_parts[1] if len(head_parts) > 1 else "").strip()
+
+    # Form: --flag=N [objective]
+    for flag in _SUPERGOAL_TURN_FLAGS:
+        if first.startswith(flag + "="):
+            val_str = first[len(flag) + 1:]
+            err = _validate_supergoal_budget(val_str)
+            if err:
+                return "", DEFAULT_SUPERGOAL_MAX_TURNS, err
+            budget = int(val_str)
+            if not remainder:
+                return (
+                    "",
+                    budget,
+                    f"missing objective — provide goal text after {first!r}",
+                )
+            return remainder, budget, None
+
+    # Form: --flag N [objective]
+    if first in _SUPERGOAL_TURN_FLAGS:
+        if not remainder:
+            return "", DEFAULT_SUPERGOAL_MAX_TURNS, f"missing budget value after {first!r}"
+        budget_parts = remainder.split(None, 1)
+        val_str = budget_parts[0]
+        text = (budget_parts[1] if len(budget_parts) > 1 else "").strip()
+        err = _validate_supergoal_budget(val_str)
+        if err:
+            return "", DEFAULT_SUPERGOAL_MAX_TURNS, err
+        budget = int(val_str)
+        if not text:
+            return (
+                "",
+                budget,
+                f"missing objective — provide goal text after the budget "
+                f"(e.g. /supergoal {first} {budget} <objective>)",
+            )
+        return text, budget, None
+
+    # Form: N [objective]  — leading integer is ALWAYS treated as a budget.
+    # If no objective follows, return an error rather than silently treating
+    # the integer as goal text — ``/supergoal 80`` is almost certainly a
+    # missing-objective mistake, not a goal named "80".
+    try:
+        positional = int(first)
+        err = _validate_supergoal_budget(first)
+        if err:
+            return "", DEFAULT_SUPERGOAL_MAX_TURNS, err
+        if not remainder:
+            return (
+                "",
+                positional,
+                f"missing objective — provide goal text after the budget "
+                f"(e.g. /supergoal {positional} <objective>)",
+            )
+        return remainder, positional, None
+    except ValueError:
+        pass
+
+    # Plain goal text — no budget specifier
+    return raw, DEFAULT_SUPERGOAL_MAX_TURNS, None
 
 
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
@@ -1729,7 +1839,9 @@ __all__ = [
     "GoalContract",
     "GoalManager",
     "parse_contract",
+    "parse_supergoal_args",
     "draft_contract",
+    "DEFAULT_SUPERGOAL_MAX_TURNS",
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",

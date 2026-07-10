@@ -2429,6 +2429,144 @@ class GatewaySlashCommandsMixin:
             return f"{base}\n(Couldn't draft a contract — running as a free-form goal.)"
         return base
 
+    async def _handle_supergoal_command(self, event: "MessageEvent") -> str:
+        """Handle /supergoal for gateway platforms.
+
+        Identical to _handle_goal_command but parses an optional turn-budget
+        specifier before the goal text (default 40 turns).
+
+        Accepted budget forms: ``80 text``, ``--turns 80 text``,
+        ``--turns=80 text`` (and aliases ``--max-turns``, ``-t``,
+        ``turns``, ``max-turns``).
+        """
+        from hermes_cli.goals import parse_supergoal_args
+
+        raw_args = (event.get_command_args() or "").strip()
+        goal_text, budget, err = parse_supergoal_args(raw_args)
+        lower = goal_text.lower()
+
+        mgr, session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+
+        if err:
+            return f"/supergoal: {err}"
+
+        if not raw_args or not goal_text:
+            return mgr.status_line()
+
+        if lower == "status":
+            return mgr.status_line()
+
+        if lower == "show":
+            return f"{mgr.status_line()}\n{mgr.render_contract()}"
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return t("gateway.goal.no_goal_set")
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("supergoal pause: pending continuation cleanup failed: %s", exc)
+            return t("gateway.goal.paused", goal=state.goal)
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return t("gateway.goal.no_resume")
+            return t("gateway.goal.resumed", goal=state.goal)
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("supergoal clear: pending continuation cleanup failed: %s", exc)
+            return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
+
+        if lower == "wait" or lower.startswith("wait "):
+            wait_arg = goal_text[len("wait"):].strip()
+            if not wait_arg:
+                return "Usage: /supergoal wait <pid> [reason]"
+            wtokens = wait_arg.split(None, 1)
+            try:
+                pid = int(wtokens[0])
+            except ValueError:
+                return "/supergoal wait: <pid> must be an integer process id."
+            reason = wtokens[1].strip() if len(wtokens) > 1 else ""
+            try:
+                mgr.wait_on(pid, reason=reason)
+            except (RuntimeError, ValueError) as exc:
+                return f"/supergoal wait: {exc}"
+            rtxt = f" ({reason})" if reason else ""
+            return f"⏳ Goal parked on pid {pid}{rtxt}. Loop pauses until it exits."
+
+        if lower == "unwait":
+            if mgr.stop_waiting():
+                return "▶ Wait barrier cleared — goal loop resumes."
+            return "No wait barrier set."
+
+        # /supergoal draft <objective>
+        draft_contract_obj = None
+        is_draft = lower == "draft" or lower.startswith("draft ")
+        if is_draft:
+            objective = goal_text[len("draft"):].strip()
+            if not objective:
+                return "Usage: /supergoal draft <objective in plain language>"
+            try:
+                import asyncio
+                from hermes_cli.goals import draft_contract
+
+                draft_contract_obj = await asyncio.get_running_loop().run_in_executor(
+                    None, draft_contract, objective
+                )
+            except Exception as exc:
+                logger.debug("supergoal draft failed: %s", exc)
+                draft_contract_obj = None
+            goal_text = objective
+            contract = draft_contract_obj
+        else:
+            from hermes_cli.goals import parse_contract
+
+            headline, parsed = parse_contract(goal_text)
+            goal_text = headline or goal_text
+            contract = parsed if not parsed.is_empty() else None
+
+        try:
+            state = mgr.set(goal_text, max_turns=budget, contract=contract)
+        except ValueError as exc:
+            return t("gateway.goal.invalid", error=str(exc))
+
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        _quick_key = self._session_key_for_source(event.source) if event.source else None
+        if adapter and _quick_key:
+            try:
+                kickoff_event = MessageEvent(
+                    text=state.goal,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                )
+                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+            except Exception as exc:
+                logger.debug("supergoal kickoff enqueue failed: %s", exc)
+
+        base = t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+        if state.has_contract():
+            return f"{base}\nCompletion contract:\n{state.contract.render_block()}"
+        if is_draft:
+            return f"{base}\n(Couldn't draft a contract — running as a free-form goal.)"
+        return base
+
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
         """Handle /subgoal for gateway platforms (mirror of CLI handler).
 

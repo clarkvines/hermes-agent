@@ -2169,10 +2169,15 @@ class CLICommandsMixin:
         except Exception:
             pass
 
-    def _handle_goal_draft(self, objective: str) -> None:
+    def _handle_goal_draft(self, objective: str, max_turns: int | None = None) -> None:
         """Draft a structured completion contract from a plain objective and
         set it as the active goal. Falls back to a bare goal if the aux model
-        can't produce a contract."""
+        can't produce a contract.
+
+        ``max_turns`` is passed through to ``mgr.set`` so /supergoal's custom
+        budget is preserved. When ``None`` the GoalManager's default is used
+        (correct for /goal which has no custom budget).
+        """
         from cli import _DIM, _RST, _cprint
         from hermes_cli.goals import draft_contract
 
@@ -2190,7 +2195,7 @@ class CLICommandsMixin:
             contract = None
 
         try:
-            state = mgr.set(objective, contract=contract)
+            state = mgr.set(objective, max_turns=max_turns, contract=contract)
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
@@ -2210,6 +2215,154 @@ class CLICommandsMixin:
                 f"  {_DIM}Couldn't draft a contract (aux model unavailable) — "
                 f"running as a free-form goal. The per-turn judge still applies.{_RST}"
             )
+        try:
+            self._pending_input.put(state.goal)
+        except Exception:
+            pass
+
+    def _handle_supergoal_command(self, cmd: str) -> None:
+        """Dispatch /supergoal: like /goal but with a configurable default 40-turn budget.
+
+        Accepts the same subcommands as /goal (status, show, draft, pause,
+        resume, clear, stop, done, wait, unwait) plus an optional budget
+        specifier before the goal text:
+
+          /supergoal objective                  → 40-turn budget (default)
+          /supergoal 80 objective               → 80 turns
+          /supergoal --turns 80 objective       → 80 turns
+          /supergoal --turns=80 objective       → 80 turns
+          Aliases: --max-turns, -t, turns, max-turns
+        """
+        from cli import _DIM, _RST, _cprint
+        from hermes_cli.goals import parse_supergoal_args
+
+        parts = (cmd or "").strip().split(None, 1)
+        raw_arg = parts[1].strip() if len(parts) > 1 else ""
+
+        goal_text, budget, err = parse_supergoal_args(raw_arg)
+
+        mgr = self._get_goal_manager()
+        if mgr is None:
+            _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
+            return
+
+        if err:
+            _cprint(f"  /supergoal: {err}")
+            return
+
+        # Bare /supergoal → show status
+        if not raw_arg:
+            _cprint(f"  {mgr.status_line()}")
+            return
+
+        # Budget flag with no goal text → show usage
+        if not goal_text:
+            _cprint("  Usage: /supergoal [[--turns N] <objective> | status | pause | resume | clear]")
+            return
+
+        lower = goal_text.lower()
+
+        if lower == "status":
+            _cprint(f"  {mgr.status_line()}")
+            return
+
+        if lower == "show":
+            _cprint(f"  {mgr.status_line()}")
+            _cprint(f"  {mgr.render_contract()}")
+            return
+
+        if lower == "draft" or lower.startswith("draft "):
+            objective = goal_text[len("draft"):].strip()
+            if not objective:
+                _cprint("  Usage: /supergoal draft <objective in plain language>")
+                return
+            self._handle_goal_draft(objective, max_turns=budget)
+            return
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                _cprint(f"  {_DIM}No goal set.{_RST}")
+            else:
+                _cprint(f"  ⏸ Goal paused: {state.goal}")
+            return
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                _cprint(f"  {_DIM}No goal to resume.{_RST}")
+            else:
+                _cprint(f"  ▶ Goal resumed: {state.goal}")
+                _cprint(
+                    f"  {_DIM}Send any message (or press Enter on an empty prompt "
+                    f"is a no-op; type 'continue' to kick it off).{_RST}"
+                )
+            return
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            if had:
+                _cprint("  ✓ Goal cleared.")
+            else:
+                _cprint(f"  {_DIM}No active goal.{_RST}")
+            return
+
+        if lower == "wait" or lower.startswith("wait "):
+            wait_arg = goal_text[len("wait"):].strip()
+            if not wait_arg:
+                _cprint("  Usage: /supergoal wait <pid> [reason]")
+                return
+            wtokens = wait_arg.split(None, 1)
+            try:
+                pid = int(wtokens[0])
+            except ValueError:
+                _cprint("  /supergoal wait: <pid> must be an integer process id.")
+                return
+            reason = wtokens[1].strip() if len(wtokens) > 1 else ""
+            try:
+                mgr.wait_on(pid, reason=reason)
+            except (RuntimeError, ValueError) as exc:
+                _cprint(f"  /supergoal wait: {exc}")
+                return
+            rtxt = f" ({reason})" if reason else ""
+            _cprint(f"  ⏳ Goal parked on pid {pid}{rtxt}. Loop pauses until it exits.")
+            return
+
+        if lower == "unwait":
+            if mgr.stop_waiting():
+                _cprint("  ▶ Wait barrier cleared — goal loop resumes.")
+            else:
+                _cprint(f"  {_DIM}No wait barrier set.{_RST}")
+            return
+
+        # Set a new goal with the parsed budget.
+        from hermes_cli.goals import parse_contract
+
+        headline, contract = parse_contract(goal_text)
+        final_text = headline or goal_text
+        try:
+            state = mgr.set(
+                final_text,
+                max_turns=budget,
+                contract=contract if not contract.is_empty() else None,
+            )
+        except ValueError as exc:
+            _cprint(f"  Invalid goal: {exc}")
+            return
+
+        _cprint(f"  ⊙ Supergoal set ({state.max_turns}-turn budget): {state.goal}")
+        if state.has_contract():
+            _cprint(f"  {_DIM}Completion contract:{_RST}")
+            for line in state.contract.render_block().splitlines():
+                _cprint(f"    {line}")
+        _cprint(
+            f"  {_DIM}After each turn, a judge model checks if the goal is done"
+            f"{' against the contract above' if state.has_contract() else ''}. "
+            f"Hermes keeps working until it is, you pause/clear it, or the budget is "
+            f"exhausted. Use /supergoal status, /supergoal show, /supergoal pause, "
+            f"/supergoal resume, /supergoal clear.{_RST}"
+        )
         try:
             self._pending_input.put(state.goal)
         except Exception:

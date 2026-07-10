@@ -6635,7 +6635,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def show_help(self):
         """Display help information with categorized commands."""
-        from hermes_cli.commands import COMMANDS_BY_CATEGORY
+        from hermes_cli.commands import COMMANDS, COMMANDS_BY_CATEGORY
 
         try:
             from hermes_cli.skin_engine import get_active_help_header
@@ -6657,7 +6657,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     continue
                 ChatConsole().print(f"    [bold {_accent_hex()}]{cmd:<15}[/] [dim]-[/] {_escape(desc)}")
 
-        skill_commands = _ensure_skill_commands()
+        skill_commands = {
+            cmd: info
+            for cmd, info in _ensure_skill_commands().items()
+            if cmd not in COMMANDS
+        }
         if skill_commands:
             _cprint(f"\n  ⚡ {_BOLD}Skill Commands{_RST} ({len(skill_commands)} installed):")
             for cmd, info in sorted(skill_commands.items()):
@@ -8991,6 +8995,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+        elif canonical == "supergoal":
+            self._handle_supergoal_command(cmd_original)
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a

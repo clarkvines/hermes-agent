@@ -40,16 +40,20 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
   })
 
-  it('surfaces /tools, /save, and /personality on the desktop', () => {
+  it('surfaces /tools, /save, /personality, and /supergoal on the desktop', () => {
     expect(isDesktopSlashSuggestion('/tools')).toBe(true)
     expect(isDesktopSlashSuggestion('/save')).toBe(true)
     expect(isDesktopSlashSuggestion('/personality')).toBe(true)
+    expect(isDesktopSlashSuggestion('/supergoal')).toBe(true)
     expect(isDesktopSlashCommand('/tools')).toBe(true)
     expect(isDesktopSlashCommand('/save')).toBe(true)
     expect(isDesktopSlashCommand('/personality')).toBe(true)
+    expect(isDesktopSlashCommand('/supergoal')).toBe(true)
+    expect(resolveDesktopCommand('/supergoal')?.surface).toEqual({ kind: 'exec' })
     expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
     expect(desktopSlashUnavailableMessage('/save')).toBeNull()
     expect(desktopSlashUnavailableMessage('/personality')).toBeNull()
+    expect(desktopSlashUnavailableMessage('/supergoal')).toBeNull()
   })
 
   it('routes /pet through the desktop action handler and drops /pets', () => {

@@ -12723,6 +12723,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "plan",
         "goal",
+        "supergoal",
         "moa",
         "undo",
         "learn",
@@ -12808,6 +12809,11 @@ def _(rid, params: dict) -> dict:
             from agent.skill_commands import scan_skill_commands
 
             for k, info in sorted(scan_skill_commands().items()):
+                # Built-in/alias commands own their names. In particular, the
+                # first-class /supergoal command must replace the legacy skill
+                # command rather than appearing twice in the TUI catalog.
+                if k.lower() in canon:
+                    continue
                 d = str(info.get("description", "Skill"))
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 skill_count += 1
@@ -13022,7 +13028,13 @@ def _(rid, params: dict) -> dict:
 
         cmds = scan_skill_commands()
         key = f"/{name}"
-        if key in cmds:
+        # First-class commands take precedence over legacy skill commands with
+        # the same slash name. This is what turns /supergoal into a real goal
+        # command on TUI/dashboard/desktop installations that still have the
+        # old supergoal skill installed.
+        from hermes_cli.commands import resolve_command
+
+        if key in cmds and resolve_command(name) is None:
             msg = build_skill_invocation_message(
                 key, arg, task_id=session.get("session_key", "") if session else ""
             )
@@ -13238,6 +13250,188 @@ def _(rid, params: dict) -> dict:
         # {type: send, notice, message} → renders `notice` as a sys line,
         # then submits `message` as a user turn. The post-turn judge
         # wired in _run_prompt_submit takes over from there.
+        return _ok(
+            rid,
+            {"type": "send", "notice": notice, "message": state.goal},
+        )
+
+    if name == "supergoal":
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.goals import GoalManager, parse_supergoal_args
+        except Exception as exc:
+            return _err(rid, 5030, f"goals unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        try:
+            goals_cfg = _load_cfg().get("goals") or {}
+            cfg_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            cfg_max_turns = 20
+
+        goal_text, budget, err = parse_supergoal_args(arg)
+        if err:
+            return _err(rid, 4004, f"/supergoal: {err}")
+
+        mgr = GoalManager(session_id=sid_key, default_max_turns=cfg_max_turns)
+        lower = goal_text.lower()
+
+        control_verb = lower.split(None, 1)[0] if lower else ""
+        is_control = (
+            not lower
+            or lower
+            in {
+                "status",
+                "show",
+                "pause",
+                "resume",
+                "clear",
+                "stop",
+                "done",
+                "unwait",
+            }
+            or control_verb == "wait"
+        )
+        if session.get("running") and not is_control:
+            return _err(
+                rid,
+                4009,
+                "session busy — /interrupt the current turn before setting a new supergoal",
+            )
+
+        # Bare /supergoal → show status.
+        if not arg.strip():
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        # Budget flag with no objective → show usage.
+        if not goal_text:
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        "Usage: /supergoal [[--turns N] <objective> "
+                        "| status | show | pause | resume | clear | draft <objective> "
+                        "| wait <pid> | unwait]"
+                    ),
+                },
+            )
+
+        if lower == "status":
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+
+        if lower == "show":
+            return _ok(
+                rid,
+                {"type": "exec", "output": f"{mgr.status_line()}\n{mgr.render_contract()}"},
+            )
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
+            return _ok(rid, {"type": "exec", "output": out})
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        f"▶ Goal resumed: {state.goal}\n"
+                        "Send any message to continue, or wait — I'll take the next step on the next turn."
+                    ),
+                },
+            )
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            return _ok(
+                rid,
+                {"type": "exec", "output": "✓ Goal cleared." if had else "No active goal."},
+            )
+
+        # /supergoal wait <pid> [reason]
+        if lower == "wait" or lower.startswith("wait "):
+            wait_arg = goal_text[len("wait"):].strip()
+            if not wait_arg:
+                return _ok(
+                    rid,
+                    {"type": "exec", "output": "Usage: /supergoal wait <pid> [reason]"},
+                )
+            wtokens = wait_arg.split(None, 1)
+            try:
+                pid = int(wtokens[0])
+            except ValueError:
+                return _err(rid, 4004, "/supergoal wait: <pid> must be an integer process id.")
+            reason = wtokens[1].strip() if len(wtokens) > 1 else ""
+            try:
+                mgr.wait_on(pid, reason=reason)
+            except (RuntimeError, ValueError) as exc:
+                return _err(rid, 4004, f"/supergoal wait: {exc}")
+            rtxt = f" ({reason})" if reason else ""
+            return _ok(
+                rid,
+                {"type": "exec", "output": f"⏳ Goal parked on pid {pid}{rtxt}. Loop pauses until it exits."},
+            )
+
+        # /supergoal unwait
+        if lower == "unwait":
+            cleared = mgr.stop_waiting()
+            out = "▶ Wait barrier cleared — goal loop resumes." if cleared else "No wait barrier set."
+            return _ok(rid, {"type": "exec", "output": out})
+
+        # /supergoal draft <objective>
+        if lower == "draft" or lower.startswith("draft "):
+            objective = goal_text[len("draft"):].strip()
+            if not objective:
+                return _ok(
+                    rid,
+                    {"type": "exec", "output": "Usage: /supergoal draft <objective in plain language>"},
+                )
+            try:
+                from hermes_cli.goals import draft_contract
+                contract = draft_contract(objective)
+            except Exception:
+                contract = None
+            try:
+                state = mgr.set(objective, max_turns=budget, contract=contract)
+            except ValueError as exc:
+                return _err(rid, 4004, f"invalid goal: {exc}")
+            notice = f"⊙ Supergoal set ({state.max_turns}-turn budget): {state.goal}"
+            if state.has_contract():
+                notice += f"\nCompletion contract:\n{state.contract.render_block()}"
+            else:
+                notice += "\n(Couldn't draft a contract — running as a free-form goal.)"
+            return _ok(rid, {"type": "send", "notice": notice, "message": state.goal})
+
+        # New goal — parse inline contract fields and set with chosen budget.
+        try:
+            from hermes_cli.goals import parse_contract
+            headline, contract = parse_contract(goal_text)
+            final_text = headline or goal_text
+            state = mgr.set(
+                final_text,
+                max_turns=budget,
+                contract=contract if not contract.is_empty() else None,
+            )
+        except ValueError as exc:
+            return _err(rid, 4004, f"invalid goal: {exc}")
+
+        notice = (
+            f"⊙ Supergoal set ({state.max_turns}-turn budget): {state.goal}\n"
+            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
+            "Controls: /supergoal status · /supergoal show · /supergoal pause · "
+            "/supergoal resume · /supergoal clear"
+        )
+        if state.has_contract():
+            notice += f"\nCompletion contract:\n{state.contract.render_block()}"
         return _ok(
             rid,
             {"type": "send", "notice": notice, "message": state.goal},

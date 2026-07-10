@@ -204,6 +204,219 @@ def test_pending_input_commands_includes_goal(server):
     assert "goal" in server._PENDING_INPUT_COMMANDS
 
 
+# ── command.dispatch /supergoal ───────────────────────────────────────
+
+
+def test_supergoal_custom_budget_persists(server, session):
+    sid, session_key, _ = session
+    r = _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg="--turns 80 build a rocket",
+        session_id=sid,
+    )
+
+    assert r["result"]["type"] == "send"
+    assert "80-turn budget" in r["result"]["notice"]
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert state.goal == "build a rocket"
+    assert state.max_turns == 80
+
+
+def test_supergoal_default_budget_is_forty(server, session):
+    sid, session_key, _ = session
+    _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg="build a rocket",
+        session_id=sid,
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(session_key).state.max_turns == 40
+
+
+def test_supergoal_inline_contract_persists(server, session):
+    sid, session_key, _ = session
+    r = _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg="--turns=60 ship it\nverify: tests pass",
+        session_id=sid,
+    )
+
+    assert r["result"]["type"] == "send"
+    assert "Completion contract" in r["result"]["notice"]
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert state.max_turns == 60
+    assert state.contract.verification == "tests pass"
+
+
+def test_supergoal_draft_preserves_budget(server, session):
+    sid, session_key, _ = session
+    from hermes_cli.goals import GoalContract, GoalManager
+
+    with patch(
+        "hermes_cli.goals.draft_contract",
+        return_value=GoalContract(verification="pytest passes"),
+    ):
+        r = _call(
+            server,
+            "command.dispatch",
+            name="supergoal",
+            arg="--turns 90 draft ship it",
+            session_id=sid,
+        )
+
+    assert r["result"]["type"] == "send"
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert state.max_turns == 90
+    assert state.contract.verification == "pytest passes"
+
+
+@pytest.mark.parametrize("arg", ["80", "--turns 80", "--turns=80"])
+def test_supergoal_budget_without_objective_is_rejected(server, session, arg):
+    sid, session_key, _ = session
+    from hermes_cli.goals import GoalManager
+
+    # The module-level TUI fixture can reuse the same session key across
+    # parametrized cases, so explicitly begin from no active goal.
+    GoalManager(session_key).clear()
+    r = _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg=arg,
+        session_id=sid,
+    )
+
+    assert r["error"]["code"] == 4004
+    assert "objective" in r["error"]["message"].lower()
+
+    assert not GoalManager(session_key).has_goal()
+
+
+def test_slash_exec_routes_supergoal_to_command_dispatch(server, session):
+    sid, session_key, _ = session
+    r = _call(
+        server,
+        "slash.exec",
+        command="supergoal 70 build a rocket",
+        session_id=sid,
+    )
+
+    assert r["result"]["type"] == "send"
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(session_key).state.max_turns == 70
+
+
+def test_pending_input_commands_includes_supergoal(server):
+    assert "supergoal" in server._PENDING_INPUT_COMMANDS
+
+
+def test_tui_catalog_lists_supergoal_once(server):
+    r = _call(server, "commands.catalog")
+    names = [pair[0] for pair in r["result"]["pairs"]]
+    assert names.count("/supergoal") == 1
+
+
+def test_supergoal_builtin_beats_legacy_skill_collision(server, session):
+    sid, session_key, _ = session
+    legacy = {
+        "/supergoal": {
+            "name": "supergoal",
+            "description": "legacy one-turn skill",
+            "skill_md_path": "/tmp/legacy/SKILL.md",
+        }
+    }
+
+    with patch("agent.skill_commands.scan_skill_commands", return_value=legacy):
+        r = _call(
+            server,
+            "command.dispatch",
+            name="supergoal",
+            arg="80 build a rocket",
+            session_id=sid,
+        )
+
+    assert r["result"]["type"] == "send"
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert state.max_turns == 80
+    assert state.goal == "build a rocket"
+
+
+def test_supergoal_rejects_new_goal_while_tui_session_busy(server, session):
+    sid, session_key, session_obj = session
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_key).clear()
+    session_obj["running"] = True
+    r = _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg="build a rocket",
+        session_id=sid,
+    )
+
+    assert r["error"]["code"] == 4009
+    assert not GoalManager(session_key).has_goal()
+
+
+def test_supergoal_status_allowed_while_tui_session_busy(server, session):
+    sid, session_key, session_obj = session
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_key).set("build a rocket", max_turns=80)
+    session_obj["running"] = True
+    r = _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg="status",
+        session_id=sid,
+    )
+
+    assert r["result"]["type"] == "exec"
+    assert "build a rocket" in r["result"]["output"]
+
+
+def test_supergoal_drafting_prefix_is_plain_objective(server, session):
+    sid, session_key, _ = session
+    _call(
+        server,
+        "command.dispatch",
+        name="supergoal",
+        arg="drafting release notes",
+        session_id=sid,
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert state.goal == "drafting release notes"
+    assert state.contract.is_empty()
+
+
 # ── command.dispatch /moa ────────────────────────────────────────────
 
 def _write_moa_config(home, text):

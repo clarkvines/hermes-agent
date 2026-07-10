@@ -10474,6 +10474,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_goal_command(event)
                 return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
+            if _cmd_def_inner and _cmd_def_inner.name == "supergoal":
+                _sg_raw = (event.get_command_args() or "").strip()
+                try:
+                    from hermes_cli.goals import parse_supergoal_args
+                    _sg_text, _, _ = parse_supergoal_args(_sg_raw)
+                except Exception:
+                    _sg_text = _sg_raw
+                _sg_lower = (_sg_text or "").lower()
+                _sg_verb = _sg_lower.split(None, 1)[0] if _sg_lower else ""
+                _sg_is_control = (
+                    not _sg_lower
+                    or _sg_lower in {"status", "show", "pause", "resume", "clear", "stop", "done", "unwait"}
+                    or _sg_verb == "wait"
+                )
+                if _sg_is_control:
+                    return await self._handle_supergoal_command(event)
+                return "Agent is running — use /supergoal status / pause / clear / wait mid-run, or /stop before setting a new supergoal."
+
             if _cmd_def_inner and _cmd_def_inner.name == "moa":
                 return "Agent is running — wait or /stop first, then run /moa."
 
@@ -11017,6 +11035,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "supergoal":
+            return await self._handle_supergoal_command(event)
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
