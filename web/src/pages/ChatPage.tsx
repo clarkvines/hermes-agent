@@ -37,6 +37,7 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import { browserPtyAttachParams } from "@/lib/pty-attach-token";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RECONNECT_INPUT_MESSAGE,
@@ -58,34 +59,6 @@ import {
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
-
-// Stable per-browser token identifying THIS chat tab's keep-alive PTY session.
-// Sent as ?attach=; lets a refresh/disconnect reattach to the same live process
-// instead of spawning a fresh one. Per-localStorage, so other devices can't grab it.
-// ``rotate`` mints a new token — used when the user explicitly starts a fresh
-// session so the old keep-alive PTY is NOT reattached (the registry reaps it).
-const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat";
-function ptyAttachToken(rotate = false): string {
-  let t = "";
-  if (!rotate) {
-    try {
-      t = window.localStorage.getItem(PTY_ATTACH_TOKEN_KEY) ?? "";
-    } catch {
-      /* private mode / storage blocked */
-    }
-  }
-  if (!t) {
-    const a = new Uint8Array(16);
-    crypto.getRandomValues(a);
-    t = Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
-    try {
-      window.localStorage.setItem(PTY_ATTACH_TOKEN_KEY, t);
-    } catch {
-      /* ignore */
-    }
-  }
-  return t;
-}
 
 // Channel id ties this chat tab's PTY child (publisher) to its sidebar
 // (subscriber).  Generated once per mount so a tab refresh starts a fresh
@@ -196,6 +169,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // (open or close). Guards the page-resume reconnect against firing during
   // the async ticket/URL await gap where wsRef.current is not yet assigned.
   const connectInFlightRef = useRef(false);
+  const connectAttemptRef = useRef(0);
   const connectingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyInputLineRef = useRef("");
   const mobileReplacementInputUntilRef = useRef(0);
@@ -895,6 +869,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // A connect attempt is now in flight — set synchronously (before the async
     // socket-open IIFE below awaits its ticket URL) so a page-resume event in
     // that gap doesn't fire a redundant reconnect (wsRef isn't assigned yet).
+    const connectAttempt = ++connectAttemptRef.current;
     connectInFlightRef.current = true;
     const clearConnectingTimer = () => {
       if (connectingTimerRef.current) {
@@ -922,15 +897,31 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const params: Record<string, string> = { channel };
       if (resumeParam) params.resume = resumeParam;
       if (forceFresh) params.fresh = "1";
-      // Keep-alive identity: reattach to this tab's living PTY across
-      // refresh/transient drops. A forced-fresh start rotates the token so
-      // the previous keep-alive PTY is not reattached (registry reaps it).
-      params.attach = ptyAttachToken(forceFresh);
+      // Keep-alive identity: reattach across refresh/transient drops. A
+      // forced-fresh start rotates the token and tells the server to close the
+      // previous full TUI process tree immediately instead of waiting for TTL.
+      const attachParams = browserPtyAttachParams(forceFresh);
+      params.attach = attachParams.attach;
+      if (attachParams.replace) params.replace = attachParams.replace;
       // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
-      const url = await api.buildWsUrl("/api/pty", params);
+      let url: string;
+      try {
+        url = await api.buildWsUrl("/api/pty", params);
+      } catch (error) {
+        if (unmounting || connectAttemptRef.current !== connectAttempt) return;
+        connectInFlightRef.current = false;
+        clearConnectingTimer();
+        console.warn("[chat] PTY WebSocket URL resolution failed", error);
+        scheduleReconnect(1006);
+        return;
+      }
+      // The effect can be replaced while a gated-mode ticket request is in
+      // flight. Never let that stale completion open an old-token socket after
+      // a newer fresh-chat effect has rotated the attachment identity.
+      if (unmounting || connectAttemptRef.current !== connectAttempt) return;
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -951,6 +942,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }, PTY_CONNECTING_TIMEOUT_MS);
 
     ws.onopen = () => {
+      if (connectAttemptRef.current !== connectAttempt || wsRef.current !== ws) {
+        ws.close();
+        return;
+      }
       clearReconnectTimer();
       clearConnectingTimer();
       connectInFlightRef.current = false;
@@ -991,6 +986,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     ws.onmessage = (ev) => {
+      if (connectAttemptRef.current !== connectAttempt || wsRef.current !== ws) return;
       if (typeof ev.data === "string") {
         term.write(ev.data);
       } else {
@@ -999,6 +995,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     ws.onclose = (ev) => {
+      if (connectAttemptRef.current !== connectAttempt || wsRef.current !== ws) return;
       wsRef.current = null;
       connectInFlightRef.current = false;
       clearConnectingTimer();

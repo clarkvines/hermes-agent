@@ -1,9 +1,47 @@
 import asyncio
+import threading
 import time
 
 import pytest
 
-from hermes_cli.pty_session import RingBuffer
+from hermes_cli.pty_session import RingBuffer, resolve_registry_settings
+
+
+def test_registry_settings_preserve_existing_defaults():
+    assert resolve_registry_settings({}) == (1800.0, 16)
+
+
+def test_registry_settings_accept_dashboard_overrides():
+    cfg = {
+        "dashboard": {
+            "pty_keepalive_ttl_seconds": 300,
+            "pty_max_sessions": 4,
+        }
+    }
+
+    assert resolve_registry_settings(cfg) == (300.0, 4)
+
+
+def test_registry_settings_reject_invalid_values_without_removing_guardrails():
+    cfg = {
+        "dashboard": {
+            "pty_keepalive_ttl_seconds": -1,
+            "pty_max_sessions": 0,
+        }
+    }
+
+    assert resolve_registry_settings(cfg) == (1800.0, 16)
+
+
+def test_registry_settings_reject_boolean_values():
+    cfg = {
+        "dashboard": {
+            "pty_keepalive_ttl_seconds": True,
+            "pty_max_sessions": False,
+        }
+    }
+
+    assert resolve_registry_settings(cfg) == (1800.0, 16)
 
 
 def test_ringbuffer_keeps_everything_under_capacity():
@@ -115,7 +153,12 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     await s.close()
 
 
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull
+from hermes_cli.pty_session import (
+    PtySession,
+    PtySessionRegistry,
+    RegistryFull,
+    RetiredToken,
+)
 
 
 def make_registry(ttl=1800.0, max_sessions=16):
@@ -132,6 +175,213 @@ async def test_same_key_reattaches_same_session():
     assert created1 is True and created2 is False
     assert s1 is s2
     assert s2.bridge is b1                     # second spawn callable was NOT used
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_spawns_only_once():
+    reg = make_registry()
+    spawned = []
+
+    def spawn():
+        bridge = FakeBridge([b"", b""])
+        spawned.append(bridge)
+        time.sleep(0.05)
+        return bridge
+
+    (s1, created1), (s2, created2) = await asyncio.gather(
+        reg.attach_or_spawn("tok", spawn=spawn),
+        reg.attach_or_spawn("tok", spawn=spawn),
+    )
+
+    assert len(spawned) == 1
+    assert s1 is s2
+    assert sorted((created1, created2)) == [False, True]
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_new_keys_respect_capacity():
+    reg = make_registry(max_sessions=1)
+
+    def spawn():
+        time.sleep(0.05)
+        return FakeBridge([b"", b""])
+
+    results = await asyncio.gather(
+        reg.attach_or_spawn("a", spawn=spawn),
+        reg.attach_or_spawn("b", spawn=spawn),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, RegistryFull) for result in results) == 1
+    assert len(reg._sessions) == 1
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_close_key_supersedes_attached_session():
+    reg = make_registry()
+    bridge = FakeBridge([b"", b""])
+    session, _ = await reg.attach_or_spawn("old", spawn=lambda: bridge)
+    ws = FakeWS()
+    await session.attach(ws)
+
+    closed = await reg.close_key("old", websocket_code=4409)
+
+    assert closed is True
+    assert ws.close_code == 4409
+    assert bridge.closed is True
+    assert "old" not in reg._sessions
+
+
+@pytest.mark.asyncio
+async def test_replacement_retires_old_token_and_rejects_late_arrival():
+    reg = make_registry()
+    old_bridge = FakeBridge([b"", b""])
+    old, _ = await reg.attach_or_spawn("old", spawn=lambda: old_bridge)
+    old_ws = FakeWS()
+    await old.attach(old_ws)
+
+    new, created = await reg.attach_or_spawn(
+        "new",
+        replace_keys=["old"],
+        replaced_websocket_code=4409,
+        spawn=lambda: FakeBridge([b"", b""]),
+    )
+
+    assert created is True
+    assert new.key == "new"
+    assert old_bridge.closed is True
+    assert old_ws.close_code == 4409
+    with pytest.raises(RetiredToken):
+        await reg.attach_or_spawn("old", spawn=lambda: FakeBridge([]))
+    with pytest.raises(RetiredToken):
+        await reg.attach("old", old, FakeWS())
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_attach_replay_failure_leaves_session_detached():
+    reg = make_registry()
+    session, _ = await reg.attach_or_spawn(
+        "tok", spawn=lambda: FakeBridge([b"buffered", b""])
+    )
+    await asyncio.sleep(0.02)
+
+    class FailingWS(FakeWS):
+        async def send_bytes(self, data):
+            raise RuntimeError("socket closed during replay")
+
+    ws = FailingWS()
+    with pytest.raises(RuntimeError, match="socket closed"):
+        await reg.attach("tok", session, ws)
+
+    assert session.attached is False
+    assert session._ws is None
+    assert session.last_detached_at is not None
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_live_send_failure_detaches_and_closes_transport():
+    release_chunk = threading.Event()
+
+    class BlockingBridge(FakeBridge):
+        def __init__(self):
+            super().__init__([])
+            self._sent = False
+
+        def read(self, timeout):
+            if not self._sent:
+                release_chunk.wait(timeout=2)
+                self._sent = True
+                return b"live output"
+            return b""
+
+    class FailingWS(FakeWS):
+        async def send_bytes(self, data):
+            raise RuntimeError("transport lost")
+
+    session = PtySession("tok", BlockingBridge(), buffer_cap=1024, read_timeout=0.01)
+    await session.start()
+    ws = FailingWS()
+    await session.attach(ws)
+    release_chunk.set()
+    await asyncio.sleep(0.05)
+
+    assert session.attached is False
+    assert session._ws is None
+    assert session.last_detached_at is not None
+    assert ws.close_code == 1001
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_replacement_waits_for_inflight_old_spawn_then_retires_it():
+    reg = make_registry()
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    old_bridge = FakeBridge([b"", b""])
+
+    def spawn_old():
+        spawn_started.set()
+        release_spawn.wait(timeout=2)
+        return old_bridge
+
+    old_task = asyncio.create_task(reg.attach_or_spawn("old", spawn=spawn_old))
+    assert await asyncio.to_thread(spawn_started.wait, 1)
+    new_task = asyncio.create_task(
+        reg.attach_or_spawn(
+            "new",
+            replace_keys=["old"],
+            replaced_websocket_code=4409,
+            spawn=lambda: FakeBridge([b"", b""]),
+        )
+    )
+    await asyncio.sleep(0.02)
+    release_spawn.set()
+
+    await old_task
+    new, _ = await new_task
+
+    assert new.key == "new"
+    assert old_bridge.closed is True
+    assert set(reg._sessions) == {"new"}
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_finishes_teardown_before_new_spawn():
+    reg = make_registry(max_sessions=1)
+    close_started = threading.Event()
+    release_close = threading.Event()
+    new_spawned = threading.Event()
+
+    class SlowCloseBridge(FakeBridge):
+        def close(self):
+            close_started.set()
+            release_close.wait(timeout=2)
+            super().close()
+
+    old_bridge = SlowCloseBridge([b"", b""])
+    old, _ = await reg.attach_or_spawn("old", spawn=lambda: old_bridge)
+    old_ws = FakeWS()
+    await old.attach(old_ws)
+    old.detach(old_ws)
+
+    def spawn_new():
+        new_spawned.set()
+        return FakeBridge([b"", b""])
+
+    task = asyncio.create_task(reg.attach_or_spawn("new", spawn=spawn_new))
+    assert await asyncio.to_thread(close_started.wait, 1)
+    assert new_spawned.is_set() is False
+    release_close.set()
+    await task
+
+    assert old_bridge.closed is True
+    assert new_spawned.is_set() is True
     await reg.close_all()
 
 
@@ -160,6 +410,12 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
     with pytest.raises(RegistryFull):
         await reg.attach_or_spawn("b", spawn=lambda: FakeBridge([]))
     await reg.close_all()
+
+
+def test_reaper_interval_tracks_short_ttl_without_polling_faster_than_once_per_second():
+    assert make_registry(ttl=0.1).reaper_interval == 1.0
+    assert make_registry(ttl=5.0).reaper_interval == 5.0
+    assert make_registry(ttl=300.0).reaper_interval == 60.0
 
 
 @pytest.mark.asyncio

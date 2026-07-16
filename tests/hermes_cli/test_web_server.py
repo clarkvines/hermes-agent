@@ -8005,6 +8005,74 @@ class TestPtyWebSocket:
         q = {"token": tok, **params}
         return f"/api/pty?{urlencode(q)}"
 
+    def test_pty_registry_factory_applies_dashboard_limits(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "load_config",
+            lambda: {
+                "dashboard": {
+                    "pty_keepalive_ttl_seconds": 300,
+                    "pty_max_sessions": 4,
+                }
+            },
+        )
+
+        registry = self.ws_module._create_pty_registry()
+
+        assert registry._ttl == 300.0
+        assert registry._max == 4
+
+    def test_fresh_attach_closes_replaced_pty_before_spawning(self, monkeypatch):
+        events: list[tuple[str, str]] = []
+
+        class FakeSession:
+            class Bridge:
+                def resize(self, **_kwargs):
+                    pass
+
+                def write(self, _raw):
+                    pass
+
+            bridge = Bridge()
+
+            async def attach(self, _ws):
+                events.append(("attach", "new"))
+
+        class FakeRegistry:
+            async def attach_or_spawn(
+                self,
+                key,
+                *,
+                spawn,
+                replace_keys=(),
+                replaced_websocket_code=None,
+            ):
+                assert replaced_websocket_code == 4409
+                for old_key in replace_keys:
+                    events.append(("close", old_key))
+                events.append(("spawn", key))
+                return FakeSession(), True
+
+            async def attach(self, key, session, ws):
+                assert key == "new"
+                await session.attach(ws)
+
+            def detach(self, key, _ws):
+                events.append(("detach", key))
+
+        async def fake_resolve(**_kwargs):
+            return (["unused"], None, None)
+
+        monkeypatch.setattr(self.ws_module, "PTY_REGISTRY", FakeRegistry())
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv_async", fake_resolve)
+
+        with self.client.websocket_connect(
+            self._url(attach="new", replace="old")
+        ):
+            pass
+
+        assert events[:3] == [("close", "old"), ("spawn", "new"), ("attach", "new")]
+
     def test_resolve_chat_argv_uses_dashboard_scroll_env(self, monkeypatch):
         """Dashboard chat runs the TUI in browser-scrollback mode."""
         import hermes_cli.main as main_mod

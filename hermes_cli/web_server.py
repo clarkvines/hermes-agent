@@ -15940,14 +15940,26 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
-
-PTY_REGISTRY = PtySessionRegistry(
-    ttl=30 * 60,
-    max_sessions=16,
-    buffer_cap=1 * 1024 * 1024,
-    read_timeout=_PTY_READ_CHUNK_TIMEOUT,
+from hermes_cli.pty_session import (  # noqa: E402
+    PtySessionRegistry,
+    RegistryFull,
+    RetiredToken,
+    WS_CLOSE_SUPERSEDED,
+    resolve_registry_settings,
+    run_reaper,
 )
+
+def _create_pty_registry() -> PtySessionRegistry:
+    ttl, max_sessions = resolve_registry_settings(load_config())
+    return PtySessionRegistry(
+        ttl=ttl,
+        max_sessions=max_sessions,
+        buffer_cap=1 * 1024 * 1024,
+        read_timeout=_PTY_READ_CHUNK_TIMEOUT,
+    )
+
+
+PTY_REGISTRY = _create_pty_registry()
 
 
 async def _legacy_pump(ws: "WebSocket", bridge) -> None:
@@ -17256,30 +17268,34 @@ async def pty_ws(ws: WebSocket) -> None:
     if attach_token is not None and (registry_resume or profile):
         # Key explicit resumes on their canonical target, never the active-session fallback.
         attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+    legacy_session = attach_token is None
+    if legacy_session:
+        # Older clients omit the keep-alive token. Give them an ephemeral
+        # registry key so they still count against the process/session cap,
+        # then close that key on disconnect to preserve legacy semantics.
+        attach_token = f"legacy-{secrets.token_urlsafe(24)}"
+    replace_tokens = [
+        token
+        for token in dict.fromkeys(
+            part.strip() for part in (ws.query_params.get("replace") or "").split(",")
+        )
+        if token and token != attach_token
+    ][-32:]
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
 
-    if attach_token is None:
-        # Legacy path: 1:1 socket<->PTY, killed on disconnect (unchanged).
-        try:
-            bridge = _spawn()
-        except PtyUnavailableError as exc:
-            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-            await ws.close(code=1011)
-            return
-        except (FileNotFoundError, OSError) as exc:
-            await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
-            await ws.close(code=1011)
-            return
-        await _legacy_pump(ws, bridge)
-        return
-
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
         session, _created = await PTY_REGISTRY.attach_or_spawn(
-            attach_token, spawn=_spawn
+            attach_token,
+            spawn=_spawn,
+            replace_keys=replace_tokens,
+            replaced_websocket_code=WS_CLOSE_SUPERSEDED,
         )
+    except RetiredToken:
+        await ws.close(code=WS_CLOSE_SUPERSEDED, reason="PTY superseded by a fresh chat")
+        return
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
@@ -17289,7 +17305,18 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    await session.attach(ws)
+    try:
+        await PTY_REGISTRY.attach(attach_token, session, ws)
+    except RetiredToken:
+        await ws.close(code=WS_CLOSE_SUPERSEDED, reason="PTY superseded by a fresh chat")
+        return
+    except (WebSocketDisconnect, RuntimeError):
+        # Registry attach is exception-safe and has already marked the session
+        # detached if replay failed. Legacy sessions must still preserve their
+        # historical kill-on-disconnect behavior.
+        if legacy_session:
+            await PTY_REGISTRY.close_key(attach_token)
+        return
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,
@@ -17324,9 +17351,14 @@ async def pty_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        # Detach only — the PTY keeps running for a reattach; the registry
-        # reaper closes it after the TTL (or immediately on process exit).
-        PTY_REGISTRY.detach(attach_token, ws)
+        if legacy_session:
+            # Legacy sockets keep their historical kill-on-disconnect behavior
+            # while still participating in the registry capacity limit.
+            await PTY_REGISTRY.close_key(attach_token)
+        else:
+            # Detach only — the PTY keeps running for a reattach; the registry
+            # reaper owns process teardown after the keep-alive TTL.
+            PTY_REGISTRY.detach(attach_token, ws)
 
 
 # ---------------------------------------------------------------------------

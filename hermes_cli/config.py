@@ -2043,6 +2043,12 @@ DEFAULT_CONFIG = {
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
+        # Browser chat PTYs are full TUI processes with their own MCP children.
+        # Detached PTYs survive briefly so refreshes and network drops can
+        # reattach without losing the in-flight turn. Operators on smaller
+        # hosts can shorten the keep-alive window and cap concurrent PTYs.
+        "pty_keepalive_ttl_seconds": 1800,
+        "pty_max_sessions": 16,
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
         # are a local debug estimate: they only count successful main-agent

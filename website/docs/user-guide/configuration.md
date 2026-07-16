@@ -112,6 +112,18 @@ For git installs, Hermes auto-stashes dirty tracked files and untracked files be
 
 Before that stash step, Hermes also restores tracked `package-lock.json` diffs left by npm install/build churn. Commit or manually stash intentional lockfile edits before updating.
 
+## Dashboard PTY Resource Limits
+
+Each browser dashboard chat runs a full TUI process with its own integration children. On memory-constrained hosts, cap how many dashboard chat PTYs may coexist and shorten how long a disconnected PTY remains available for refresh or network-drop reattachment:
+
+```yaml
+dashboard:
+  pty_max_sessions: 4
+  pty_keepalive_ttl_seconds: 300
+```
+
+The defaults remain 16 sessions and 1,800 seconds. When the cap is reached, Hermes first evicts the oldest detached PTY. It never evicts an attached PTY to make room. Starting a fresh dashboard chat closes the previous browser PTY immediately; the TTL is only for refresh and transient-disconnect recovery. Restart the dashboard after changing these settings.
+
 ## Terminal Backend Configuration
 
 Hermes supports six terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, or a Singularity/Apptainer container.
