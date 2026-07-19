@@ -735,6 +735,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting: bool = False
         self._polling_progress_verifier_task: Optional[asyncio.Task] = None
+        self._send_ready_timeout_event: Optional[asyncio.Event] = None
         self._polling_teardown_started: bool = False
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
@@ -2042,6 +2043,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_verifier_task = None
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
+        self._send_ready_timeout_event = None
         self._polling_progress_accepting = True
         self._send_path_degraded = True
         return self._polling_generation, self._polling_progress_event
@@ -2058,6 +2060,56 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count = 0
         self._polling_conflict_count = 0
         self._send_path_degraded = False
+
+    async def wait_until_send_ready(
+        self,
+        timeout: float = _POLLING_PROGRESS_TIMEOUT,
+    ) -> bool:
+        """Wait for the current polling generation to prove outbound readiness.
+
+        ``connect()`` intentionally returns after PTB starts polling, before the
+        first successful ``getUpdates`` response. During that bounded window
+        ``send()`` reports ``send_path_degraded`` so background/cron callers can
+        use their standalone fallback. Gateway lifecycle sends have no such
+        fallback, so they use this readiness hook instead of racing a fixed
+        startup sleep.
+        """
+        if not getattr(self, "_bot", None):
+            return False
+        if not getattr(self, "_send_path_degraded", False):
+            return True
+        if getattr(self, "_webhook_mode", False):
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout))
+        while getattr(self, "_send_path_degraded", False):
+            if getattr(self, "_polling_teardown_started", False):
+                return False
+            progress = getattr(self, "_polling_progress_event", None)
+            if progress is None:
+                return False
+            if getattr(self, "_send_ready_timeout_event", None) is progress:
+                return False
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._send_ready_timeout_event = progress
+                return False
+            if progress.is_set():
+                # A network-error backoff marks the adapter degraded before it
+                # starts the replacement polling generation. The prior healthy
+                # generation's Event is still set during that gap; awaiting it
+                # would complete immediately and spin until the deadline.
+                await asyncio.sleep(min(1.0, remaining))
+                continue
+            try:
+                # Re-check once per second so a reconnect generation replacing
+                # the Event cannot strand this waiter on the old object.
+                await asyncio.wait_for(progress.wait(), timeout=min(1.0, remaining))
+            except asyncio.TimeoutError:
+                continue
+
+        return bool(getattr(self, "_bot", None))
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.

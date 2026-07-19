@@ -5,12 +5,14 @@ can enter a wedged state where ``bot.send_message()`` returns a valid Message
 but nothing reaches the recipient.  ``_send_path_degraded`` short-circuits
 ``send()`` so cron's live-adapter branch falls through to standalone HTTP.
 """
+import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import HomeChannel, Platform, PlatformConfig
+from tests.gateway.restart_test_helpers import make_restart_runner
 
 
 def _ensure_telegram_mock():
@@ -62,6 +64,94 @@ async def test_send_short_circuits_when_path_degraded():
     assert result.error == "send_path_degraded"
     assert result.retryable is True
     adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_returns_immediately_when_healthy():
+    adapter = _make_adapter()
+
+    assert await adapter.wait_until_send_ready(timeout=0) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_unblocks_on_polling_progress():
+    adapter = _make_adapter()
+    generation, _progress = adapter._begin_polling_generation()
+
+    waiter = asyncio.create_task(adapter.wait_until_send_ready(timeout=1))
+    await asyncio.sleep(0)
+    assert waiter.done() is False
+
+    adapter._record_polling_progress(generation)
+
+    assert await waiter is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_startup_send_waits_for_real_telegram_polling_progress():
+    """Exercise the adapter event through the gateway lifecycle sender."""
+    adapter = _make_adapter()
+    generation, _progress = adapter._begin_polling_generation()
+    runner, _ = make_restart_runner(adapter)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        name="Home",
+    )
+
+    notification = asyncio.create_task(
+        runner._send_home_channel_startup_notifications()
+    )
+    await asyncio.sleep(0)
+    adapter._bot.send_message.assert_not_awaited()
+
+    adapter._record_polling_progress(generation)
+    delivered = await notification
+
+    assert delivered == {("telegram", "123", None)}
+    adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_caches_timeout_for_same_generation():
+    adapter = _make_adapter()
+    adapter._begin_polling_generation()
+
+    assert await adapter.wait_until_send_ready(timeout=0) is False
+    assert adapter._send_path_degraded is True
+    # Startup has several lifecycle senders. A timed-out generation must not
+    # make each one pay the full readiness timeout again.
+    assert await asyncio.wait_for(
+        adapter.wait_until_send_ready(timeout=1),
+        timeout=0.05,
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_does_not_spin_on_stale_progress_event(
+    monkeypatch,
+):
+    """A reconnect backoff can degrade a generation whose Event is already set."""
+    adapter = _make_adapter()
+    generation, _progress = adapter._begin_polling_generation()
+    adapter._record_polling_progress(generation)
+    adapter._send_path_degraded = True
+
+    real_sleep = asyncio.sleep
+    sleep_calls = 0
+
+    async def tracked_sleep(delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        await real_sleep(delay)
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        tracked_sleep,
+    )
+
+    assert await adapter.wait_until_send_ready(timeout=0.01) is False
+    assert sleep_calls >= 1
 
 
 @pytest.mark.asyncio

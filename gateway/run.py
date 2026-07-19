@@ -229,6 +229,35 @@ def _non_conversational_metadata(
     return merged
 
 
+async def _wait_for_adapter_send_ready(adapter: Any) -> bool:
+    """Await an adapter's optional pre-send readiness contract.
+
+    Some adapters can accept inbound work before their outbound path is ready.
+    Telegram polling intentionally reports ``send_path_degraded`` until the
+    first successful ``getUpdates`` generation proves transport health. Startup
+    lifecycle messages run inside that window, so they must honor the adapter's
+    readiness signal instead of racing a fixed sleep. Adapters without the
+    optional hook preserve the existing immediate-send behavior.
+    """
+    wait_fn = getattr(adapter, "wait_until_send_ready", None)
+    if not callable(wait_fn):
+        return True
+    try:
+        readiness = wait_fn()
+        if inspect.isawaitable(readiness):
+            readiness = await readiness
+        return bool(readiness)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Adapter send-readiness check failed for %s: %s",
+            getattr(getattr(adapter, "platform", None), "value", "unknown"),
+            exc,
+        )
+        return False
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -7124,6 +7153,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
+            assert source is not None  # candidates exclude originless entries
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -7132,6 +7162,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
+
+            # Older/synthetic Telegram DM routing entries can persist the chat
+            # identity without a separate sender identity. Telegram guarantees
+            # that a private chat ID is the user's stable ID, and the live
+            # adapter applies the same fallback when building inbound sources.
+            # Reconstruct only this platform/type pair before the fail-closed
+            # auth gate; group chats and every platform where DM channel IDs are
+            # not user IDs remain unchanged.
+            if (
+                source.platform == Platform.TELEGRAM
+                and source.chat_type == "dm"
+                and not source.user_id
+                and source.chat_id
+            ):
+                source = dataclasses.replace(source, user_id=str(source.chat_id))
 
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
@@ -7867,7 +7912,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # of a restart cycle (see _is_stale_restart_redelivery).
         if _restart_notification_pending() or planned_restart_notification_pending:
             self._booted_from_restart = True
-        await self._send_restart_notification()
+        restart_target = await self._send_restart_notification()
+        if restart_target is None and _restart_notification_pending():
+            self._schedule_restart_notification_watch()
 
         # Broadcast a lightweight "gateway is back" message to configured home
         # channels only for non-chat planned restarts (terminal/SIGUSR1/service
@@ -15784,6 +15831,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _schedule_restart_notification_watch(self) -> None:
+        """Retry a transiently deferred chat-originated restart notification."""
+        existing_task = getattr(self, "_restart_notification_task", None)
+        if existing_task and not existing_task.done():
+            return
+        try:
+            self._restart_notification_task = asyncio.create_task(
+                self._watch_restart_notification()
+            )
+        except RuntimeError:
+            logger.debug("Skipping restart notification watcher: no running event loop")
+
+    async def _watch_restart_notification(
+        self,
+        poll_interval: float = 2.0,
+        timeout: float = 300.0,
+    ) -> None:
+        """Retry the durable restart marker until sent or definitively cleared."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while _restart_notification_pending() and loop.time() < deadline:
+            delivered = await self._send_restart_notification()
+            if delivered is not None or not _restart_notification_pending():
+                return
+            await asyncio.sleep(poll_interval)
+        if _restart_notification_pending():
+            logger.warning(
+                "Restart notification remains pending after %.0fs; "
+                "it will be retried on the next gateway startup",
+                timeout,
+            )
+
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
         existing_task = getattr(self, "_update_notification_task", None)
@@ -16105,6 +16184,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
 
             if adapter and chat_id:
+                if not await _wait_for_adapter_send_ready(adapter):
+                    logger.info(
+                        "Update notification deferred: %s send path not ready",
+                        platform_str,
+                    )
+                    cleanup = False
+                    active_pending_path = pending_path
+                    claimed_path.replace(pending_path)
+                    return False
+
                 metadata = self._thread_metadata_for_target(
                     platform,
                     chat_id,
@@ -16137,6 +16226,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id,
                     exit_code,
                 )
+        except asyncio.CancelledError:
+            # Cancellation can land after the durable marker has been claimed
+            # but before the readiness wait or send completes. Re-queue the
+            # marker and keep its output/exit evidence so the next startup or
+            # watcher attempt can deliver exactly once.
+            cleanup = False
+            active_pending_path = pending_path
+            if claimed_path.exists() and not pending_path.exists():
+                claimed_path.replace(pending_path)
+            raise
         except Exception as e:
             logger.warning("Post-update notification failed: %s", e)
         finally:
@@ -16154,6 +16253,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notify_path.exists():
             return None
 
+        cleanup = True
         try:
             data = json.loads(notify_path.read_text())
             platform_str = data.get("platform")
@@ -16182,6 +16282,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
+            if not await _wait_for_adapter_send_ready(adapter):
+                logger.warning(
+                    "Restart notification deferred: %s send path did not become ready",
+                    platform_str,
+                )
+                cleanup = False
+                return None
+
             metadata = self._thread_metadata_for_target(
                 platform,
                 chat_id,
@@ -16206,6 +16314,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id,
                     getattr(result, "error", "send returned success=False"),
                 )
+                if getattr(result, "retryable", False):
+                    cleanup = False
                 return None
 
             logger.info(
@@ -16214,11 +16324,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id,
             )
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
+        except asyncio.CancelledError:
+            cleanup = False
+            raise
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup:
+                notify_path.unlink(missing_ok=True)
 
     async def _send_home_channel_startup_notifications(
         self,
@@ -16250,6 +16364,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
             if target in skipped or target in delivered:
+                continue
+
+            if not await _wait_for_adapter_send_ready(adapter):
+                logger.warning(
+                    "Home-channel startup notification deferred for %s:%s: "
+                    "send path did not become ready",
+                    platform.value,
+                    home.chat_id,
+                )
                 continue
 
             try:

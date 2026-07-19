@@ -1,5 +1,6 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +12,7 @@ from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
+    RestartTestAdapter,
     make_restart_runner,
     make_restart_source,
 )
@@ -246,6 +248,50 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
 # ── home-channel startup notifications ─────────────────────────────────────
 
 
+class _DelayedSendReadyAdapter(RestartTestAdapter):
+    """Model Telegram's connect-before-first-getUpdates startup window."""
+
+    def __init__(self):
+        super().__init__()
+        self.send_ready = False
+        self.wait_calls = 0
+
+    async def wait_until_send_ready(self):
+        self.wait_calls += 1
+        self.send_ready = True
+        return True
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if not self.send_ready:
+            return SendResult(
+                success=False,
+                error="send_path_degraded",
+                retryable=True,
+            )
+        return await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+
+class _NeverReadyRestartAdapter(RestartTestAdapter):
+    async def wait_until_send_ready(self):
+        return False
+
+
+class _ToggleReadyRestartAdapter(RestartTestAdapter):
+    def __init__(self):
+        super().__init__()
+        self.ready = False
+        self.first_attempt = asyncio.Event()
+
+    async def wait_until_send_ready(self):
+        self.first_attempt.set()
+        return self.ready
+
+
 @pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_to_configured_home(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -265,6 +311,27 @@ async def test_send_home_channel_startup_notification_to_configured_home(tmp_pat
         "home-42",
         "♻️ Gateway online — Hermes is back and ready.",
     )
+
+
+@pytest.mark.asyncio
+async def test_startup_notification_waits_for_adapter_send_readiness(
+    tmp_path, monkeypatch
+):
+    """Lifecycle delivery must not race Telegram's first polling progress."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    adapter = _DelayedSendReadyAdapter()
+    runner, _ = make_restart_runner(adapter)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "home-42", None)}
+    assert adapter.wait_calls == 1
+    assert adapter.sent == ["♻️ Gateway online — Hermes is back and ready."]
 
 
 @pytest.mark.asyncio
@@ -395,6 +462,74 @@ async def test_send_restart_notification_delivers_and_cleans_up(tmp_path, monkey
     assert call_args[0][0] == "42"  # chat_id
     assert "restarted" in call_args[0][1].lower()
     assert call_args[1].get("metadata") is None  # no thread
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_waits_for_adapter_send_readiness(
+    tmp_path, monkeypatch
+):
+    """Chat-targeted restart delivery shares the readiness contract."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+    adapter = _DelayedSendReadyAdapter()
+    runner, _ = make_restart_runner(adapter)
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    assert adapter.wait_calls == 1
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_retries_after_send_path_becomes_ready(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+    runner, _ = make_restart_runner(_NeverReadyRestartAdapter())
+
+    assert await runner._send_restart_notification() is None
+    assert notify_path.exists()
+
+    ready_adapter = _DelayedSendReadyAdapter()
+    runner.adapters = {Platform.TELEGRAM: ready_adapter}
+    assert await runner._send_restart_notification() == ("telegram", "42", None)
+    assert len(ready_adapter.sent) == 1
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_watcher_retries_until_ready(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+    adapter = _ToggleReadyRestartAdapter()
+    runner, _ = make_restart_runner(adapter)
+
+    watcher = asyncio.create_task(
+        runner._watch_restart_notification(poll_interval=0.001, timeout=0.2)
+    )
+    await adapter.first_attempt.wait()
+    adapter.ready = True
+    await watcher
+
+    assert len(adapter.sent) == 1
     assert not notify_path.exists()
 
 

@@ -36,6 +36,7 @@ from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
+    GatewayRunner,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
@@ -1240,6 +1241,92 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
     # No slot was claimed and nothing was persisted for the skipped session.
     assert pending_entry.session_key not in runner._running_agents
     runner._persist_active_agents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_recovers_legacy_telegram_dm_identity(
+    monkeypatch,
+):
+    """A persisted Telegram DM may have chat_id but no user_id.
+
+    Telegram private-chat IDs are the sender's stable user ID. Startup auth
+    should reconstruct that identity before applying the current allowlist,
+    while preserving the fail-closed gate for every other source shape.
+    """
+    runner, adapter = make_restart_runner()
+    runner._is_user_authorized = GatewayRunner._is_user_authorized.__get__(
+        runner, GatewayRunner
+    )
+    runner.pairing_store = MagicMock(
+        is_approved=MagicMock(return_value=False)
+    )
+    runner._persist_active_agents = MagicMock()
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "resume-chat")
+
+    source = make_restart_source(chat_id="resume-chat")
+    source.user_id = None
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    resumed_event = adapter.handle_message.await_args_list[0].args[0]
+    assert resumed_event.source.user_id == "resume-chat"
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_does_not_reconstruct_group_sender_identity(
+    monkeypatch,
+):
+    """A group chat ID must never stand in for a missing sender identity."""
+    runner, adapter = make_restart_runner()
+    runner._is_user_authorized = GatewayRunner._is_user_authorized.__get__(
+        runner, GatewayRunner
+    )
+    runner.pairing_store = MagicMock(
+        is_approved=MagicMock(return_value=False)
+    )
+    runner._persist_active_agents = MagicMock()
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "group-chat")
+
+    source = make_restart_source(chat_id="group-chat", chat_type="group")
+    source.user_id = None
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:group-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.session_key not in runner._running_agents
 
 
 @pytest.mark.asyncio

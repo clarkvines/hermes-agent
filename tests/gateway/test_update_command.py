@@ -4,6 +4,7 @@ Tests both the _handle_update_command handler (spawns update process) and
 the _send_update_notification startup hook (sends results after restart).
 """
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -11,8 +12,9 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
+from tests.gateway.restart_test_helpers import RestartTestAdapter
 
 
 def _make_event(text="/update", platform=Platform.TELEGRAM,
@@ -531,6 +533,49 @@ class TestUpdateCommandPlatformGate:
 # ---------------------------------------------------------------------------
 
 
+class _DelayedUpdateSendAdapter(RestartTestAdapter):
+    def __init__(self):
+        super().__init__()
+        self.ready = False
+        self.wait_calls = 0
+
+    async def wait_until_send_ready(self):
+        self.wait_calls += 1
+        self.ready = True
+        return True
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if not self.ready:
+            return SendResult(
+                success=False,
+                error="send_path_degraded",
+                retryable=True,
+            )
+        return await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+
+class _NeverReadyUpdateAdapter(RestartTestAdapter):
+    async def wait_until_send_ready(self):
+        return False
+
+
+class _BlockingUpdateSendAdapter(RestartTestAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wait_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait_until_send_ready(self):
+        self.wait_started.set()
+        await self.release.wait()
+        return True
+
+
 class TestSendUpdateNotification:
     """Tests for GatewayRunner._send_update_notification."""
 
@@ -624,6 +669,93 @@ class TestSendUpdateNotification:
         call_args = mock_adapter.send.call_args
         assert call_args[0][0] == "67890"  # chat_id
         assert "Update complete" in call_args[0][1] or "update finished" in call_args[0][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_waits_for_send_readiness_before_update_notification(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        adapter = _DelayedUpdateSendAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is True
+        assert adapter.wait_calls == 1
+        assert len(adapter.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_preserves_update_marker_when_send_path_stays_unready(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        adapter = _NeverReadyUpdateAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_readiness_wait_preserves_update_markers(
+        self,
+        tmp_path,
+    ):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        output_path.write_text("done")
+        exit_code_path.write_text("0")
+        adapter = _BlockingUpdateSendAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            notification = asyncio.create_task(runner._send_update_notification())
+            await adapter.wait_started.wait()
+            notification.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await notification
+
+            assert pending_path.exists()
+            assert not (hermes_home / ".update_pending.claimed.json").exists()
+            assert output_path.exists()
+            assert exit_code_path.exists()
+
+            adapter.release.set()
+            assert await runner._send_update_notification() is True
+
+        assert len(adapter.sent) == 1
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
 
     @pytest.mark.asyncio
     async def test_sends_notification_with_thread_metadata(self, tmp_path):
