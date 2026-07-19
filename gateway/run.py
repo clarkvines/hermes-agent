@@ -1428,6 +1428,42 @@ def _planned_restart_notification_pending() -> bool:
     return _planned_restart_notification_path().exists()
 
 
+def _planned_restart_delivered_targets() -> set[tuple[str, str, Optional[str]]]:
+    """Read home targets already notified for the current durable restart marker."""
+    path = _planned_restart_notification_path()
+    try:
+        data = json.loads(path.read_text())
+        raw_targets = data.get("delivered_targets", []) if isinstance(data, dict) else []
+        return {
+            (str(item[0]), str(item[1]), str(item[2]) if item[2] is not None else None)
+            for item in raw_targets
+            if isinstance(item, list) and len(item) == 3 and item[0] and item[1]
+        }
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return set()
+
+
+def _record_planned_restart_delivered_targets(
+    targets: set[tuple[str, str, Optional[str]]],
+) -> None:
+    """Persist partial delivery so a crash/restart cannot duplicate targets."""
+    path = _planned_restart_notification_path()
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["delivered_targets"] = [
+        [platform, chat_id, thread_id]
+        for platform, chat_id, thread_id in sorted(
+            targets,
+            key=lambda target: (target[0], target[1], target[2] or ""),
+        )
+    ]
+    atomic_json_write(path, data)
+
+
 def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 
@@ -7922,14 +7958,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in .restart_notify.json, so keep that lifecycle in the originating
         # chat/topic instead of also leaking it to the configured home channel.
         if planned_restart_notification_pending:
-            _delivered, retryable_pending = (
+            previously_delivered = _planned_restart_delivered_targets()
+            delivered_now, retryable_pending = (
                 await self._attempt_home_channel_startup_notifications(
-                    skip_targets=None,
+                    skip_targets=previously_delivered,
                 )
             )
             if retryable_pending:
                 self._schedule_home_startup_notification_watch(
-                    delivered_targets=_delivered,
+                    delivered_targets=previously_delivered | delivered_now,
                 )
             else:
                 _clear_planned_restart_notification()
@@ -15893,8 +15930,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         delivered_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
     ) -> None:
         """Retry a transiently deferred planned-restart home notification."""
-        already_delivered = getattr(self, "_home_startup_delivered_targets", set())
-        self._home_startup_delivered_targets = already_delivered | (delivered_targets or set())
+        if delivered_targets and _planned_restart_notification_pending():
+            _record_planned_restart_delivered_targets(
+                _planned_restart_delivered_targets() | delivered_targets
+            )
         existing_task = getattr(self, "_home_startup_notification_task", None)
         if existing_task and not existing_task.done():
             return
@@ -15916,9 +15955,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Retry the planned-restart marker until delivered or definitive."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        delivered_targets = set(
-            getattr(self, "_home_startup_delivered_targets", set())
-        )
+        delivered_targets = _planned_restart_delivered_targets()
         while _planned_restart_notification_pending() and loop.time() < deadline:
             delivered, retryable_pending = (
                 await self._attempt_home_channel_startup_notifications(
@@ -15926,10 +15963,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             )
             delivered_targets.update(delivered)
-            self._home_startup_delivered_targets = delivered_targets
-            if not retryable_pending:
+            if retryable_pending:
+                _record_planned_restart_delivered_targets(delivered_targets)
+            else:
                 _clear_planned_restart_notification()
-                self._home_startup_delivered_targets = set()
                 return
             await asyncio.sleep(poll_interval)
         if _planned_restart_notification_pending():
@@ -15964,7 +16001,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Resolve the adapter and chat_id for sending messages
         adapter = None
+        platform = None
+        platform_str = None
         chat_id = None
+        chat_type = None
+        thread_id = None
+        message_id = None
         session_key = None
         metadata = None
         for path in (claimed_path, pending_path):
@@ -15995,15 +16037,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
-        if not adapter or not chat_id:
-            logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
-            # Fall back to completion-only: wait for the exit code and send the
-            # final notification. _send_update_notification re-resolves the
-            # adapter on every call, so when the target platform is still
-            # reconnecting it returns False and keeps the markers. Keep polling
-            # until it actually delivers (returns True) instead of giving up
-            # after the first completion check — otherwise a platform that
-            # reconnects a few seconds after completion never gets notified.
+        if not platform or not chat_id:
+            logger.warning("Update watcher: invalid adapter/chat target, falling back to completion-only")
+            # A malformed legacy marker cannot support interactive streaming.
+            # Preserve the established completion-only behavior.
             while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
                 if exit_code_path.exists() and await self._send_update_notification():
                     return
@@ -16011,6 +16048,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
                 exit_code_path.write_text("124")
                 await self._send_update_notification()
+            return
+
+        # A configured platform can reconnect after this watcher starts. Keep
+        # the interactive path alive and re-resolve the adapter so pending
+        # update prompts are forwarded after recovery instead of timing out in
+        # completion-only mode.
+        while adapter is None and loop.time() < deadline:
+            adapter = self.adapters.get(platform)
+            if adapter is not None:
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    chat_id,
+                    thread_id,
+                    chat_type=chat_type,
+                    reply_to_message_id=message_id,
+                    adapter=adapter,
+                )
+                break
+            if exit_code_path.exists() and await self._send_update_notification():
+                return
+            await asyncio.sleep(poll_interval)
+
+        if adapter is None:
+            if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
+                exit_code_path.write_text("124")
+            await self._send_update_notification()
             return
 
         def _strip_ansi(text: str) -> str:
@@ -16408,21 +16471,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
-        for platform, adapter in self.adapters.items():
+        for platform, platform_cfg in self.config.platforms.items():
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
-                logger.info(
-                    "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
-                    platform.value,
-                )
+            if not platform_cfg.enabled or not platform_cfg.gateway_restart_notification:
+                if platform_cfg.enabled:
+                    logger.info(
+                        "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
+                        platform.value,
+                    )
                 continue
 
             target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
             if target in skipped or target in delivered:
+                continue
+
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                logger.info(
+                    "Home-channel startup notification deferred for %s:%s: adapter not connected",
+                    platform.value,
+                    home.chat_id,
+                )
+                retryable_pending = True
                 continue
 
             if not await _wait_for_adapter_send_ready(adapter):

@@ -637,6 +637,47 @@ async def test_planned_home_notification_retries_then_clears_marker(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_planned_home_missing_enabled_adapter_is_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner.adapters = {}
+
+    delivered, retryable = await runner._attempt_home_channel_startup_notifications()
+
+    assert delivered == set()
+    assert retryable is True
+
+
+@pytest.mark.asyncio
+async def test_planned_home_retry_uses_persisted_delivered_targets(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_pending.json"
+    marker.write_text(json.dumps({
+        "requested_at": 1,
+        "delivered_targets": [["telegram", "home-42", None]],
+    }))
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    await runner._watch_home_startup_notifications(
+        poll_interval=0.001,
+        timeout=0.05,
+    )
+
+    assert adapter.sent == []
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
 async def test_send_restart_notification_cleans_up_on_send_failure(
     tmp_path, monkeypatch
 ):

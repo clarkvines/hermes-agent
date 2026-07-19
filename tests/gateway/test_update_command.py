@@ -821,6 +821,46 @@ class TestSendUpdateNotification:
         assert not (hermes_home / ".update_pending.json").exists()
 
     @pytest.mark.asyncio
+    async def test_streaming_watcher_recovers_missing_adapter_and_forwards_prompt(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+            "session_key": "telegram:67890",
+        }))
+        (hermes_home / ".update_prompt.json").write_text(json.dumps({
+            "prompt": "Continue?",
+            "default": "yes",
+        }))
+        runner.adapters = {}
+        adapter = _DelayedUpdateSendAdapter()
+
+        async def _reconnect_and_finish():
+            await asyncio.sleep(0.005)
+            runner.adapters[Platform.TELEGRAM] = adapter
+            for _ in range(50):
+                if runner._update_prompt_pending.get("telegram:67890"):
+                    break
+                await asyncio.sleep(0.001)
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        finisher = asyncio.create_task(_reconnect_and_finish())
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=0.001,
+                timeout=0.1,
+            )
+        await finisher
+
+        assert any("Update needs your input" in content for content in adapter.sent)
+        assert not (hermes_home / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
     async def test_streaming_watcher_does_not_bypass_send_readiness(self, tmp_path):
         """The progress watcher must not race its direct sends past readiness."""
         runner = _make_runner()
