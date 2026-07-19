@@ -8991,6 +8991,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             await self._cancel_secondary_profile_reconnect_tasks()
 
+            # Lifecycle retry tasks may currently be inside adapter readiness
+            # or send calls. Cancel and await them immediately after entering
+            # shutdown, while adapters are still connected, so no stale
+            # "online" lifecycle send can race the active-session shutdown
+            # notices. Cancellation-safe marker restoration also completes
+            # before any adapter teardown begins.
+            await GatewayRunner._cancel_lifecycle_notification_watchers(self)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
@@ -8998,12 +9006,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),
             )
-
-            # Lifecycle retry tasks may currently be inside adapter readiness
-            # or send calls. Cancel and await them while adapters are still
-            # connected so cancellation-safe marker restoration completes
-            # before teardown, and no stale "online" send races shutdown.
-            await GatewayRunner._cancel_lifecycle_notification_watchers(self)
 
             timeout = self._restart_drain_timeout
 

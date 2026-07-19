@@ -156,9 +156,13 @@ async def test_gateway_stop_awaits_lifecycle_watchers_before_adapter_disconnect(
     runner._background_tasks.add(lifecycle_task)
     lifecycle_task.add_done_callback(runner._background_tasks.discard)
 
+    async def _notify_sessions() -> None:
+        order.append("notify_sessions")
+
     async def _disconnect() -> None:
         order.append("disconnect")
 
+    runner._notify_active_sessions_of_shutdown = _notify_sessions
     adapter.disconnect = _disconnect
     await started.wait()
 
@@ -167,6 +171,7 @@ async def test_gateway_stop_awaits_lifecycle_watchers_before_adapter_disconnect(
     await asyncio.sleep(0)
 
     assert lifecycle_task.done()
+    assert order.index("lifecycle_cancelled") < order.index("notify_sessions")
     assert order.index("lifecycle_cancelled") < order.index("disconnect")
 
 
