@@ -47,6 +47,38 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     assert gateway_run._planned_restart_notification_pending() is False
 
 
+def test_rearm_pending_lifecycle_notification_watches(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner._running = True
+    runner._schedule_restart_notification_watch = MagicMock()
+    runner._schedule_update_notification_watch = MagicMock()
+    runner._schedule_home_startup_notification_watch = MagicMock()
+    (tmp_path / ".restart_notify.json").write_text("{}")
+    (tmp_path / ".update_pending.json").write_text("{}")
+    (tmp_path / ".restart_pending.json").write_text("{}")
+
+    runner._rearm_pending_lifecycle_notification_watches()
+
+    runner._schedule_restart_notification_watch.assert_called_once_with()
+    runner._schedule_update_notification_watch.assert_called_once_with()
+    runner._schedule_home_startup_notification_watch.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_restart_watcher_timeout_rearms_durable_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner._running = True
+    runner._rearm_pending_lifecycle_notification_watches = MagicMock()
+    (tmp_path / ".restart_notify.json").write_text("{}")
+
+    await runner._watch_restart_notification(timeout=0)
+    await asyncio.sleep(0)
+
+    runner._rearm_pending_lifecycle_notification_watches.assert_called_once_with()
+
+
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
 
 

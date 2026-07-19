@@ -8700,6 +8700,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 platform.value,
                                 exc_info=True,
                             )
+                        # A lifecycle watcher may have exhausted its bounded
+                        # startup window while this platform was offline. The
+                        # durable markers are the obligation; reconnect is the
+                        # readiness transition that must re-arm their senders.
+                        self._rearm_pending_lifecycle_notification_watches()
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                         self._update_platform_runtime_status(
@@ -15894,6 +15899,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             logger.debug("Skipping restart notification watcher: no running event loop")
 
+    def _rearm_pending_lifecycle_notification_watches(self) -> None:
+        """Re-arm durable lifecycle obligations after timeout or reconnect."""
+        if not getattr(self, "_running", False):
+            return
+        if _restart_notification_pending():
+            self._schedule_restart_notification_watch()
+        if any(
+            path.exists()
+            for path in (
+                _hermes_home / ".update_pending.json",
+                _hermes_home / ".update_pending.claimed.json",
+            )
+        ):
+            self._schedule_update_notification_watch()
+        if _planned_restart_notification_pending():
+            self._schedule_home_startup_notification_watch()
+
     async def _cancel_lifecycle_notification_watchers(self) -> None:
         """Cancel and reap lifecycle senders before adapters begin teardown.
 
@@ -15957,9 +15979,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _restart_notification_pending():
             logger.warning(
                 "Restart notification remains pending after %.0fs; "
-                "it will be retried on the next gateway startup",
+                "it will be retried after readiness changes",
                 timeout,
             )
+            loop.call_soon(self._rearm_pending_lifecycle_notification_watches)
 
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
@@ -16025,9 +16048,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _planned_restart_notification_pending():
             logger.warning(
                 "Planned-restart home notification remains pending after %.0fs; "
-                "it will be retried on the next gateway startup",
+                "it will be retried after readiness changes",
                 timeout,
             )
+            loop.call_soon(self._rearm_pending_lifecycle_notification_watches)
 
     async def _watch_update_progress(
         self,
@@ -16292,6 +16316,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 (_hermes_home / ".update_response").unlink(missing_ok=True)
                 if session_key:
                     self._update_prompt_pending.pop(session_key, None)
+        if pending_path.exists() or claimed_path.exists():
+            loop.call_soon(self._rearm_pending_lifecycle_notification_watches)
 
     async def _send_update_notification(self) -> bool:
         """If an update finished, notify the user.

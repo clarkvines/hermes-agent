@@ -323,6 +323,36 @@ class TestPlatformReconnectWatcher:
         )
 
     @pytest.mark.asyncio
+    async def test_reconnect_rearms_pending_lifecycle_notifications(self):
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+        runner._rearm_pending_lifecycle_notification_watches = MagicMock()
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+        succeed_adapter = StubAdapter(succeed=True)
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=succeed_adapter):
+            runner._running = True
+            call_count = 0
+
+            async def fake_sleep(_n):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    runner._running = False
+                await real_sleep(0)
+
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                await runner._platform_reconnect_watcher()
+
+        runner._rearm_pending_lifecycle_notification_watches.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_reconnect_nonretryable_removed_from_queue(self):
         """Non-retryable errors should remove the platform from the retry queue."""
         runner = _make_runner()
