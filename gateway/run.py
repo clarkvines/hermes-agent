@@ -1995,6 +1995,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    classify_send_error,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -15851,38 +15852,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
-    _LIFECYCLE_PERMANENT_SEND_ERROR_FRAGMENTS = (
-        "chat not found",
-        "target not found",
-        "recipient not found",
-        "bot was blocked",
-        "blocked by user",
-        "forbidden",
-        "unauthorized",
-        "not authorized",
-        "invalid token",
-        "invalid chat",
-        "account deactivated",
-        "empty message",
-    )
-
     @classmethod
     def _lifecycle_send_failure_should_retry(cls, result: Any) -> bool:
         """Fail durable lifecycle sends closed when adapters under-classify errors.
 
         ``SendResult.retryable`` historically defaults to ``False`` and several
         adapters return that default from broad transport-exception handlers.
-        Treat an unclassified failed result as transient unless its error is a
-        known permanent destination/authentication problem.  This prevents a
-        temporary provider outage from consuming update/restart obligations.
+        Use the shared machine-readable classifier when available, then classify
+        legacy error text through the same shared helper.  Only a destination
+        known to be forbidden or absent is definitive; every unclassified
+        failure retains the durable obligation instead of guessing it was sent.
         """
         if getattr(result, "retryable", False):
             return True
-        error = str(getattr(result, "error", "") or "").casefold()
-        return not any(
-            fragment in error
-            for fragment in cls._LIFECYCLE_PERMANENT_SEND_ERROR_FRAGMENTS
+        error_kind = getattr(result, "error_kind", None) or classify_send_error(
+            None,
+            str(getattr(result, "error", "") or ""),
         )
+        return error_kind not in {"forbidden", "not_found"}
 
 
 
