@@ -16276,14 +16276,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
-                            prompt_result = await adapter.send(
-                                chat_id,
-                                f"⚕ **Update needs your input:**\n\n"
-                                f"{prompt_text}{default_hint}\n\n"
-                                f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
-                                f"or type your answer directly.",
-                                metadata=_non_conversational_metadata(metadata, platform=platform),
-                            )
+                            try:
+                                prompt_result = await adapter.send(
+                                    chat_id,
+                                    f"⚕ **Update needs your input:**\n\n"
+                                    f"{prompt_text}{default_hint}\n\n"
+                                    f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
+                                    f"or type your answer directly.",
+                                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as prompt_err:
+                                logger.info(
+                                    "Update prompt send raised for %s; deferring: %s",
+                                    session_key,
+                                    prompt_err,
+                                )
+                                await asyncio.sleep(poll_interval)
+                                continue
                             if (
                                 prompt_result is not None
                                 and getattr(prompt_result, "success", True) is False

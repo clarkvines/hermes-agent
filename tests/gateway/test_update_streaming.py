@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -381,6 +381,52 @@ class TestWatchUpdateProgress:
         assert mock_adapter.prompt_calls.call_args.kwargs["metadata"] == {
             "thread_id": "777"
         }
+
+    @pytest.mark.asyncio
+    async def test_prompt_forwarding_retries_after_adapter_exception(self, tmp_path):
+        """A transient prompt send exception must not strand the updater."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "user_id": "222",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        (hermes_home / ".update_output.txt").write_text("")
+        (hermes_home / ".update_prompt.json").write_text(json.dumps({
+            "prompt": "Restore local changes? [Y/n]",
+            "default": "y",
+            "id": "retry-prompt",
+        }))
+
+        adapter = AsyncMock()
+        adapter.send.side_effect = [
+            RuntimeError("network down"),
+            SendResult(success=True, message_id="prompt-1"),
+            SendResult(success=True, message_id="done-1"),
+        ]
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        async def finish_update():
+            await asyncio.sleep(0.35)
+            (hermes_home / ".update_response").write_text("y")
+            await asyncio.sleep(0.2)
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            finisher = asyncio.create_task(finish_update())
+            try:
+                await runner._watch_update_progress(
+                    poll_interval=0.05,
+                    stream_interval=0.1,
+                    timeout=5.0,
+                )
+            finally:
+                await finisher
+
+        assert adapter.send.await_count >= 3
 
     @pytest.mark.asyncio
     async def test_cleans_up_on_completion(self, tmp_path):
