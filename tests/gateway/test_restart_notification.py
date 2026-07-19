@@ -816,6 +816,25 @@ async def test_send_restart_notification_preserves_marker_when_send_raises(
     assert notify_path.exists()
 
 
+def test_lifecycle_send_classifier_stops_known_permanent_slack_failures():
+    runner, _adapter = make_restart_runner()
+
+    for error in (
+        "invalid_auth",
+        "account_inactive",
+        "token_revoked",
+        "not_in_channel",
+        "channel_not_found",
+    ):
+        assert runner._lifecycle_send_failure_should_retry(
+            SendResult(success=False, error=error)
+        ) is False
+
+    assert runner._lifecycle_send_failure_should_retry(
+        SendResult(success=False, error="temporary transport outage")
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_send_restart_notification_preserves_unclassified_failed_send(
     tmp_path, monkeypatch

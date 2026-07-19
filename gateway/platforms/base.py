@@ -2024,11 +2024,22 @@ def classify_send_error(exc: Optional[BaseException], error_text: str = "") -> s
         or "not enough rights" in blob
         or "have no rights" in blob
         or "not a member" in blob
+        # Slack Web API permanent auth/membership failures. Slack surfaces
+        # these stable machine codes inside exception strings; treating them
+        # as unknown makes durable lifecycle watchers retry every two seconds
+        # forever even though reconnect cannot make the same token/target work.
+        or "invalid_auth" in blob
+        or "account_inactive" in blob
+        or "token_revoked" in blob
+        or "not_in_channel" in blob
+        or "no_permission" in blob
+        or "not_allowed_token_type" in blob
+        or "is_archived" in blob
     ):
         return "forbidden"
     if any(s in blob for s in _CHAT_LEVEL_NOT_FOUND_SUBSTRINGS) or any(
         s in blob for s in _SUBCHAT_NOT_FOUND_SUBSTRINGS
-    ):
+    ) or "channel_not_found" in blob:
         return "not_found"
     if (
         "flood" in blob
