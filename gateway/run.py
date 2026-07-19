@@ -7922,11 +7922,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in .restart_notify.json, so keep that lifecycle in the originating
         # chat/topic instead of also leaking it to the configured home channel.
         if planned_restart_notification_pending:
-            try:
-                await self._send_home_channel_startup_notifications(
+            _delivered, retryable_pending = (
+                await self._attempt_home_channel_startup_notifications(
                     skip_targets=None,
                 )
-            finally:
+            )
+            if retryable_pending:
+                self._schedule_home_startup_notification_watch(
+                    delivered_targets=_delivered,
+                )
+            else:
                 _clear_planned_restart_notification()
 
         # Automatically continue fresh sessions that were interrupted by the
@@ -15837,9 +15842,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if existing_task and not existing_task.done():
             return
         try:
-            self._restart_notification_task = asyncio.create_task(
-                self._watch_restart_notification()
-            )
+            task = asyncio.create_task(self._watch_restart_notification())
+            self._restart_notification_task = task
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
         except RuntimeError:
             logger.debug("Skipping restart notification watcher: no running event loop")
 
@@ -15870,11 +15878,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         try:
-            self._update_notification_task = asyncio.create_task(
-                self._watch_update_progress()
-            )
+            task = asyncio.create_task(self._watch_update_progress())
+            self._update_notification_task = task
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
         except RuntimeError:
             logger.debug("Skipping update notification watcher: no running event loop")
+
+    def _schedule_home_startup_notification_watch(
+        self,
+        *,
+        delivered_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+    ) -> None:
+        """Retry a transiently deferred planned-restart home notification."""
+        already_delivered = getattr(self, "_home_startup_delivered_targets", set())
+        self._home_startup_delivered_targets = already_delivered | (delivered_targets or set())
+        existing_task = getattr(self, "_home_startup_notification_task", None)
+        if existing_task and not existing_task.done():
+            return
+        try:
+            task = asyncio.create_task(self._watch_home_startup_notifications())
+            self._home_startup_notification_task = task
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+        except RuntimeError:
+            logger.debug("Skipping home startup notification watcher: no running event loop")
+
+    async def _watch_home_startup_notifications(
+        self,
+        poll_interval: float = 2.0,
+        timeout: float = 300.0,
+    ) -> None:
+        """Retry the planned-restart marker until delivered or definitive."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        delivered_targets = set(
+            getattr(self, "_home_startup_delivered_targets", set())
+        )
+        while _planned_restart_notification_pending() and loop.time() < deadline:
+            delivered, retryable_pending = (
+                await self._attempt_home_channel_startup_notifications(
+                    skip_targets=delivered_targets,
+                )
+            )
+            delivered_targets.update(delivered)
+            self._home_startup_delivered_targets = delivered_targets
+            if not retryable_pending:
+                _clear_planned_restart_notification()
+                self._home_startup_delivered_targets = set()
+                return
+            await asyncio.sleep(poll_interval)
+        if _planned_restart_notification_pending():
+            logger.warning(
+                "Planned-restart home notification remains pending after %.0fs; "
+                "it will be retried on the next gateway startup",
+                timeout,
+            )
 
     async def _watch_update_progress(
         self,
@@ -15932,21 +15995,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
-        # A reconnected adapter can exist before its transport is ready for
-        # outbound lifecycle traffic. Honor the same optional readiness
-        # contract as the completion-only path before this watcher streams
-        # output, forwards prompts, or sends final status directly. If the
-        # bounded wait fails, reuse the durable completion-only retry loop so
-        # markers remain authoritative instead of racing a degraded send.
-        if adapter and chat_id and not await _wait_for_adapter_send_ready(adapter):
-            logger.info(
-                "Update watcher: %s send path not ready, falling back to completion-only",
-                platform_str,
-            )
-            adapter = None
-
         if not adapter or not chat_id:
-            logger.warning("Update watcher: cannot resolve ready adapter/chat_id, falling back to completion-only")
+            logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
             # Fall back to completion-only: wait for the exit code and send the
             # final notification. _send_update_notification re-resolves the
             # adapter on every call, so when the target platform is still
@@ -15996,46 +16046,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Update stream send failed: %s", e)
 
         while loop.time() < deadline:
-            # Check for completion
+            # Readiness is tied to the adapter's current reconnect generation.
+            # Recheck every poll so a transient startup timeout neither races a
+            # send nor permanently disables prompt forwarding after recovery.
+            if not await _wait_for_adapter_send_ready(adapter):
+                await asyncio.sleep(poll_interval)
+                continue
+
+            # Check for completion. The durable completion sender owns marker
+            # claiming, SendResult validation, retry, and cleanup.
             if exit_code_path.exists():
-                # Read any remaining output
-                if output_path.exists():
-                    try:
-                        content = output_path.read_text()
-                        if len(content) > bytes_sent:
-                            buffer += content[bytes_sent:]
-                            bytes_sent = len(content)
-                    except OSError:
-                        pass
-                await _flush_buffer()
-
-                # Send final status
-                try:
-                    exit_code_raw = exit_code_path.read_text().strip() or "1"
-                    exit_code = int(exit_code_raw)
-                    if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
-                            "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
-                    else:
-                        await adapter.send(
-                            chat_id,
-                            "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
-                    logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
-                except Exception as e:
-                    logger.warning("Update final notification failed: %s", e)
-
-                # Cleanup
-                for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
-                    p.unlink(missing_ok=True)
-                (_hermes_home / ".update_response").unlink(missing_ok=True)
-                self._update_prompt_pending.pop(session_key, None)
-                return
+                if await self._send_update_notification():
+                    prompt_path.unlink(missing_ok=True)
+                    (_hermes_home / ".update_response").unlink(missing_ok=True)
+                    if session_key:
+                        self._update_prompt_pending.pop(session_key, None)
+                    return
+                await asyncio.sleep(poll_interval)
+                continue
 
             # Check for new output
             if output_path.exists():
@@ -16067,22 +16095,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _flush_buffer()
                         # Try platform-native buttons first (Discord, Telegram)
                         sent_buttons = False
-                        if getattr(type(adapter), "send_update_prompt", None) is not None:
+                        prompt_sender: Any = getattr(adapter, "send_update_prompt", None)
+                        if callable(prompt_sender):
                             try:
-                                await adapter.send_update_prompt(
+                                prompt_result = await prompt_sender(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
                                     metadata=_non_conversational_metadata(metadata, platform=platform),
                                 )
-                                sent_buttons = True
+                                sent_buttons = not (
+                                    prompt_result is not None
+                                    and getattr(prompt_result, "success", True) is False
+                                )
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
+                            prompt_result = await adapter.send(
                                 chat_id,
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
@@ -16090,6 +16122,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"or type your answer directly.",
                                 metadata=_non_conversational_metadata(metadata, platform=platform),
                             )
+                            if (
+                                prompt_result is not None
+                                and getattr(prompt_result, "success", True) is False
+                            ):
+                                logger.info(
+                                    "Update prompt send deferred for %s: %s",
+                                    session_key,
+                                    getattr(prompt_result, "error", "send returned success=False"),
+                                )
+                                await asyncio.sleep(poll_interval)
+                                continue
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
                         # next watcher can recover by re-forwarding it from
@@ -16103,24 +16146,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             await asyncio.sleep(poll_interval)
 
-        # Timeout
+        # Timeout becomes durable completion evidence. The normal completion
+        # sender validates readiness and SendResult and owns marker cleanup;
+        # a transient failure therefore remains retryable on the next startup.
         if not exit_code_path.exists():
             logger.warning("Update watcher timed out after %.0fs", timeout)
             exit_code_path.write_text("124")
-            await _flush_buffer()
-            try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
-            except Exception:
-                pass
-            for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
-                p.unlink(missing_ok=True)
-            (_hermes_home / ".update_response").unlink(missing_ok=True)
-            self._update_prompt_pending.pop(session_key, None)
+            if await self._send_update_notification():
+                prompt_path.unlink(missing_ok=True)
+                (_hermes_home / ".update_response").unlink(missing_ok=True)
+                if session_key:
+                    self._update_prompt_pending.pop(session_key, None)
 
     async def _send_update_notification(self) -> bool:
         """If an update finished, notify the user.
@@ -16228,11 +16264,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
+                result = await adapter.send(
                     chat_id,
                     msg,
                     metadata=_non_conversational_metadata(metadata, platform=platform),
                 )
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.warning(
+                        "Post-update notification to %s:%s was not delivered: %s",
+                        platform_str,
+                        chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    if getattr(result, "retryable", False):
+                        cleanup = False
+                        active_pending_path = pending_path
+                        claimed_path.replace(pending_path)
+                        return False
+                    return True
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
                     platform_str,
@@ -16282,9 +16331,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self.adapters.get(platform)
             if not adapter:
                 logger.debug(
-                    "Restart notification skipped: %s adapter not connected",
+                    "Restart notification deferred: %s adapter not connected",
                     platform_str,
                 )
+                cleanup = False
                 return None
 
             platform_cfg = self.config.platforms.get(platform)
@@ -16347,18 +16397,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cleanup:
                 notify_path.unlink(missing_ok=True)
 
-    async def _send_home_channel_startup_notifications(
+    async def _attempt_home_channel_startup_notifications(
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
-    ) -> set[tuple[str, str, Optional[str]]]:
-        """Notify configured home channels that the gateway is back online.
-
-        The notification is best-effort and sent once per connected platform
-        home channel. ``skip_targets`` lets startup avoid duplicate messages
-        when a more specific restart notification is queued for the same chat.
-        """
+    ) -> tuple[set[tuple[str, str, Optional[str]]], bool]:
+        """Attempt home startup sends and report whether retryable work remains."""
         delivered: set[tuple[str, str, Optional[str]]] = set()
+        retryable_pending = False
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
@@ -16386,6 +16432,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value,
                     home.chat_id,
                 )
+                retryable_pending = True
                 continue
 
             try:
@@ -16418,6 +16465,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         home.chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
+                    if getattr(result, "retryable", False):
+                        retryable_pending = True
                     continue
 
                 delivered.add(target)
@@ -16427,6 +16476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.chat_id,
                 )
             except Exception as exc:
+                retryable_pending = True
                 logger.warning(
                     "Home-channel startup notification failed for %s:%s: %s",
                     platform.value,
@@ -16434,6 +16484,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
+        return delivered, retryable_pending
+
+    async def _send_home_channel_startup_notifications(
+        self,
+        *,
+        skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+    ) -> set[tuple[str, str, Optional[str]]]:
+        """Notify home channels, preserving the historical delivered-set API."""
+        delivered, _retryable_pending = (
+            await self._attempt_home_channel_startup_notifications(
+                skip_targets=skip_targets,
+            )
+        )
         return delivered
 
     def _set_session_env(self, context: SessionContext) -> list:

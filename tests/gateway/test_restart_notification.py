@@ -577,8 +577,8 @@ async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, monkeypatch):
-    """If the requester's platform isn't connected, clean up without crashing."""
+async def test_send_restart_notification_preserves_when_adapter_missing(tmp_path, monkeypatch):
+    """A temporarily missing requester adapter keeps the durable retry marker."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
@@ -591,8 +591,49 @@ async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, mo
 
     await runner._send_restart_notification()
 
-    # File cleaned up even though we couldn't send
-    assert not notify_path.exists()
+    assert notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_watcher_is_tracked_for_shutdown(monkeypatch):
+    runner, _adapter = make_restart_runner()
+
+    async def _wait_forever(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_watch_restart_notification", _wait_forever)
+    runner._schedule_restart_notification_watch()
+    task = runner._restart_notification_task
+
+    assert task in runner._background_tasks
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_planned_home_notification_retries_then_clears_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_pending.json"
+    marker.write_text("{}")
+    adapter = _ToggleReadyRestartAdapter()
+    runner, _ = make_restart_runner(adapter)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    watcher = asyncio.create_task(
+        runner._watch_home_startup_notifications(poll_interval=0.001, timeout=0.2)
+    )
+    await adapter.first_attempt.wait()
+    assert marker.exists()
+    adapter.ready = True
+    await watcher
+
+    assert adapter.sent == ["♻️ Gateway online — Hermes is back and ready."]
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio

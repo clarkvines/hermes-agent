@@ -581,6 +581,29 @@ class _NeverReadyUpdateAdapter(RestartTestAdapter):
         return False
 
 
+class _RetryableFailureUpdateAdapter(RestartTestAdapter):
+    async def wait_until_send_ready(self):
+        return True
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(content)
+        return SendResult(
+            success=False,
+            error="send_path_degraded",
+            retryable=True,
+        )
+
+
+class _RecoveringUpdateAdapter(RestartTestAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wait_calls = 0
+
+    async def wait_until_send_ready(self):
+        self.wait_calls += 1
+        return self.wait_calls > 1
+
+
 class _BlockingUpdateSendAdapter(RestartTestAdapter):
     def __init__(self):
         super().__init__()
@@ -734,6 +757,70 @@ class TestSendUpdateNotification:
         assert adapter.sent == []
 
     @pytest.mark.asyncio
+    async def test_preserves_update_marker_on_retryable_send_result(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        adapter = _RetryableFailureUpdateAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert (hermes_home / ".update_output.txt").exists()
+        assert (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_streaming_watcher_rechecks_readiness_and_forwards_prompt(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+            "session_key": "telegram:67890",
+        }))
+        (hermes_home / ".update_prompt.json").write_text(json.dumps({
+            "prompt": "Continue?",
+            "default": "yes",
+        }))
+        adapter = _RecoveringUpdateAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        async def _finish_after_prompt():
+            for _ in range(50):
+                if runner._update_prompt_pending.get("telegram:67890"):
+                    break
+                await asyncio.sleep(0.001)
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        finisher = asyncio.create_task(_finish_after_prompt())
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=0.001,
+                timeout=0.1,
+            )
+        await finisher
+
+        assert adapter.wait_calls >= 2
+        assert any("Update needs your input" in content for content in adapter.sent)
+        assert not (hermes_home / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
     async def test_streaming_watcher_does_not_bypass_send_readiness(self, tmp_path):
         """The progress watcher must not race its direct sends past readiness."""
         runner = _make_runner()
@@ -788,8 +875,8 @@ class TestSendUpdateNotification:
                 timeout=0.1,
             )
 
-        assert adapter.wait_calls == 1
-        assert len(adapter.sent) == 2
+        assert adapter.wait_calls == 2
+        assert len(adapter.sent) == 1
         assert any("Hermes update finished" in content for content in adapter.sent)
         assert not pending_path.exists()
         assert not (hermes_home / ".update_output.txt").exists()
