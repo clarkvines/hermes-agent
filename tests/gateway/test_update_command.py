@@ -388,7 +388,19 @@ class TestUpdateCommandPlatformGate:
     mattermost, teams, …) are NOT in the frozenset and rely on the
     registry's ``allow_update_command=True`` fallback.  Programmatic
     interfaces (ACP, API server, webhooks) must be blocked.
+
+    Allowed-platform tests deliberately continue through the marker-writing
+    path.  Keep the dynamically imported ``gateway.run._hermes_home`` isolated
+    for the whole class so a developer running this file cannot leave synthetic
+    ``.update_pending.json`` state in their real Hermes home.
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_update_markers(self, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        with patch("gateway.run._hermes_home", hermes_home):
+            yield hermes_home
 
     @pytest.mark.asyncio
     async def test_blocks_programmatic_interface(self, monkeypatch):
