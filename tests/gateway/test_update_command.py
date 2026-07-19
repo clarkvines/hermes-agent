@@ -765,6 +765,37 @@ class TestSendUpdateNotification:
         assert (hermes_home / ".update_exit_code").exists()
 
     @pytest.mark.asyncio
+    async def test_streaming_watcher_waits_then_sends_when_ready(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        adapter = _DelayedUpdateSendAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=0.001,
+                timeout=0.1,
+            )
+
+        assert adapter.wait_calls == 1
+        assert len(adapter.sent) == 2
+        assert any("Hermes update finished" in content for content in adapter.sent)
+        assert not pending_path.exists()
+        assert not (hermes_home / ".update_output.txt").exists()
+        assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
     async def test_cancellation_during_readiness_wait_preserves_update_markers(
         self,
         tmp_path,
