@@ -9003,7 +9003,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # or send calls. Cancel and await them while adapters are still
             # connected so cancellation-safe marker restoration completes
             # before teardown, and no stale "online" send races shutdown.
-            await self._cancel_lifecycle_notification_watchers()
+            await GatewayRunner._cancel_lifecycle_notification_watchers(self)
 
             timeout = self._restart_drain_timeout
 
