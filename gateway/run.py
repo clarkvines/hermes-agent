@@ -16322,6 +16322,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if pending_path.exists() or claimed_path.exists():
             loop.call_soon(self._rearm_pending_lifecycle_notification_watches)
 
+    async def _resolve_ready_lifecycle_adapter(
+        self,
+        platform: Platform,
+    ) -> Optional[BasePlatformAdapter]:
+        """Return the ready adapter that is still registered after its wait.
+
+        Reconnect can replace adapter A with B while A's readiness await is in
+        progress. A successful wait on A must not authorize a later send
+        through that stale or disconnected instance.
+        """
+        while True:
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                return None
+            ready = await _wait_for_adapter_send_ready(adapter)
+            if self.adapters.get(platform) is not adapter:
+                logger.info(
+                    "Lifecycle notification adapter changed during readiness for %s; rebinding",
+                    platform.value,
+                )
+                continue
+            return adapter if ready else None
+
     async def _send_update_notification(self) -> bool:
         """If an update finished, notify the user.
 
@@ -16397,7 +16420,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
 
             if adapter and chat_id:
-                if not await _wait_for_adapter_send_ready(adapter):
+                adapter = await self._resolve_ready_lifecycle_adapter(platform)
+                if adapter is None:
                     logger.info(
                         "Update notification deferred: %s send path not ready",
                         platform_str,
@@ -16523,7 +16547,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
-            if not await _wait_for_adapter_send_ready(adapter):
+            adapter = await self._resolve_ready_lifecycle_adapter(platform)
+            if adapter is None:
                 logger.warning(
                     "Restart notification deferred: %s send path did not become ready",
                     platform_str,
@@ -16625,7 +16650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 retryable_pending = True
                 continue
 
-            if not await _wait_for_adapter_send_ready(adapter):
+            adapter = await self._resolve_ready_lifecycle_adapter(platform)
+            if adapter is None:
                 logger.warning(
                     "Home-channel startup notification deferred for %s:%s: "
                     "send path did not become ready",

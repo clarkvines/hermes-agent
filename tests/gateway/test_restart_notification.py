@@ -358,6 +358,38 @@ async def test_send_home_channel_startup_notification_to_configured_home(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_home_startup_send_rebinds_if_adapter_replaced_during_readiness(
+    tmp_path, monkeypatch
+):
+    """A readiness wait may not authorize a later send through stale adapter A."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    old_adapter = _BlockingReadyRestartAdapter()
+    new_adapter = RestartTestAdapter()
+    old_adapter.send = AsyncMock()
+    new_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: old_adapter}
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    attempt = asyncio.create_task(
+        runner._attempt_home_channel_startup_notifications()
+    )
+    await asyncio.wait_for(old_adapter.wait_started.wait(), timeout=1)
+    runner.adapters[Platform.TELEGRAM] = new_adapter
+    old_adapter.release.set()
+    delivered, retryable_pending = await asyncio.wait_for(attempt, timeout=1)
+
+    assert delivered == {("telegram", "home-42", None)}
+    assert retryable_pending is False
+    old_adapter.send.assert_not_awaited()
+    new_adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_startup_notification_waits_for_adapter_send_readiness(
     tmp_path, monkeypatch
 ):
