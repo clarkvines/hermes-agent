@@ -785,6 +785,54 @@ async def test_send_restart_notification_preserves_marker_when_send_raises(
 
 
 @pytest.mark.asyncio
+async def test_send_restart_notification_preserves_unclassified_failed_send(
+    tmp_path, monkeypatch
+):
+    """A failed SendResult is retryable unless its error is known permanent."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(
+        success=False,
+        error="temporary transport outage",
+    ))
+
+    assert await runner._send_restart_notification() is None
+    assert notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_planned_restart_preserves_unclassified_failed_home_send(
+    tmp_path, monkeypatch
+):
+    """A transient-looking failed result keeps planned-home work durable."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_pending.json"
+    marker.write_text(json.dumps({"requested_at": 1}))
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(
+        success=False,
+        error="temporary transport outage",
+    ))
+
+    await runner._watch_home_startup_notifications(
+        poll_interval=0.001,
+        timeout=0.01,
+    )
+
+    assert marker.exists()
+
+
+@pytest.mark.asyncio
 async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     tmp_path, monkeypatch, caplog
 ):

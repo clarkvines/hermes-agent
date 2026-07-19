@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -173,6 +174,59 @@ async def test_gateway_stop_awaits_lifecycle_watchers_before_adapter_disconnect(
     assert lifecycle_task.done()
     assert order.index("lifecycle_cancelled") < order.index("notify_sessions")
     assert order.index("lifecycle_cancelled") < order.index("disconnect")
+
+
+@pytest.mark.asyncio
+async def test_startup_scheduled_update_sender_cannot_outlive_shutdown(
+    tmp_path, monkeypatch
+):
+    """Startup lifecycle work is tracked, cancelled, and requeued before teardown."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    pending_path = tmp_path / ".update_pending.json"
+    pending_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+        "user_id": "42",
+    }))
+    output_path = tmp_path / ".update_output.txt"
+    exit_code_path = tmp_path / ".update_exit_code"
+    output_path.write_text("done")
+    exit_code_path.write_text("0")
+
+    runner, adapter = make_restart_runner()
+    runner._running = True
+    readiness_started = asyncio.Event()
+    never_ready = asyncio.Event()
+    order: list[str] = []
+
+    async def _wait_until_send_ready() -> bool:
+        readiness_started.set()
+        await never_ready.wait()
+        return True
+
+    async def _disconnect() -> None:
+        order.append("disconnect")
+
+    setattr(adapter, "wait_until_send_ready", _wait_until_send_ready)
+    adapter.send = AsyncMock(side_effect=lambda *args, **kwargs: order.append("send"))
+    adapter.disconnect = _disconnect
+
+    # This is the exact tracked scheduling path used by GatewayRunner.start().
+    runner._rearm_pending_lifecycle_notification_watches()
+    await asyncio.wait_for(readiness_started.wait(), timeout=1)
+    task = runner._update_notification_task
+    assert task is not None and not task.done()
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert task.done()
+    assert "send" not in order
+    assert order == ["disconnect"]
+    assert pending_path.exists()
+    assert not (tmp_path / ".update_pending.claimed.json").exists()
+    assert output_path.exists()
+    assert exit_code_path.exists()
 
 
 @pytest.mark.asyncio

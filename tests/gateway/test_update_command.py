@@ -782,6 +782,39 @@ class TestSendUpdateNotification:
         assert (hermes_home / ".update_exit_code").exists()
 
     @pytest.mark.asyncio
+    async def test_preserves_update_marker_on_unclassified_failed_send(self, tmp_path):
+        """Adapters omitting retryable=True must not lose durable update work."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        output_path.write_text("done")
+        exit_code_path.write_text("0")
+        adapter = AsyncMock()
+        adapter.wait_until_send_ready.return_value = True
+        adapter.send.return_value = SendResult(
+            success=False,
+            error="temporary transport outage",
+        )
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
+
+    @pytest.mark.asyncio
     async def test_streaming_watcher_rechecks_readiness_and_forwards_prompt(self, tmp_path):
         runner = _make_runner()
         runner._update_prompt_pending = {}

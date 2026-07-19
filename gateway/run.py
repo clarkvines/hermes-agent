@@ -7921,55 +7921,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
         
-        # Check if we're restarting after a /update command. If the update is
-        # still running, keep watching so we notify once it actually finishes.
-        notified = await self._send_update_notification()
-        if not notified and any(
-            path.exists()
-            for path in (
-                _hermes_home / ".update_pending.json",
-                _hermes_home / ".update_pending.claimed.json",
-            )
-        ):
-            self._schedule_update_notification_watch()
-
-        # Give freshly connected platform adapters a brief moment to settle
-        # before sending restart/startup lifecycle messages. In practice this
-        # helps Discord thread deliveries right after reconnect.
-        if connected_count > 0:
-            await asyncio.sleep(1.0)
-
-        # Notify the chat that initiated /restart that the gateway is back.
+        # Lifecycle notifications are durable work, not part of the startup
+        # call stack. Schedule every pending obligation through the tracked
+        # watcher handles so concurrent shutdown can cancel and await the send
+        # before adapters are disconnected. Directly awaiting these sends here
+        # allowed start() to outlive stop() while blocked in adapter readiness.
         planned_restart_notification_pending = _planned_restart_notification_pending()
-        # Capture, before _send_restart_notification() unlinks the marker,
-        # whether this process booted from a chat-originated /restart. Used as
-        # a one-shot signal by the /restart redelivery guard so a missing
-        # dedup marker only suppresses a /restart when we KNOW we just came out
-        # of a restart cycle (see _is_stale_restart_redelivery).
         if _restart_notification_pending() or planned_restart_notification_pending:
             self._booted_from_restart = True
-        restart_target = await self._send_restart_notification()
-        if restart_target is None and _restart_notification_pending():
-            self._schedule_restart_notification_watch()
 
-        # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
-        if planned_restart_notification_pending:
-            previously_delivered = _planned_restart_delivered_targets()
-            delivered_now, retryable_pending = (
-                await self._attempt_home_channel_startup_notifications(
-                    skip_targets=previously_delivered,
-                )
-            )
-            if retryable_pending:
-                self._schedule_home_startup_notification_watch(
-                    delivered_targets=previously_delivered | delivered_now,
-                )
-            else:
-                _clear_planned_restart_notification()
+        # Give freshly connected platform adapters a brief moment to settle
+        # before the tracked watchers attempt restart/update/home delivery.
+        if connected_count > 0:
+            await asyncio.sleep(1.0)
+        if await self._abort_startup_if_shutdown_requested():
+            return True
+        self._rearm_pending_lifecycle_notification_watches()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -15884,6 +15851,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
+    _LIFECYCLE_PERMANENT_SEND_ERROR_FRAGMENTS = (
+        "chat not found",
+        "target not found",
+        "recipient not found",
+        "bot was blocked",
+        "blocked by user",
+        "forbidden",
+        "unauthorized",
+        "not authorized",
+        "invalid token",
+        "invalid chat",
+        "account deactivated",
+        "empty message",
+    )
+
+    @classmethod
+    def _lifecycle_send_failure_should_retry(cls, result: Any) -> bool:
+        """Fail durable lifecycle sends closed when adapters under-classify errors.
+
+        ``SendResult.retryable`` historically defaults to ``False`` and several
+        adapters return that default from broad transport-exception handlers.
+        Treat an unclassified failed result as transient unless its error is a
+        known permanent destination/authentication problem.  This prevents a
+        temporary provider outage from consuming update/restart obligations.
+        """
+        if getattr(result, "retryable", False):
+            return True
+        error = str(getattr(result, "error", "") or "").casefold()
+        return not any(
+            fragment in error
+            for fragment in cls._LIFECYCLE_PERMANENT_SEND_ERROR_FRAGMENTS
+        )
+
 
 
     def _schedule_restart_notification_watch(self) -> None:
@@ -16467,7 +16467,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
-                    if getattr(result, "retryable", False):
+                    if self._lifecycle_send_failure_should_retry(result):
                         cleanup = False
                         active_pending_path = pending_path
                         claimed_path.replace(pending_path)
@@ -16580,7 +16580,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id,
                     getattr(result, "error", "send returned success=False"),
                 )
-                if getattr(result, "retryable", False):
+                if self._lifecycle_send_failure_should_retry(result):
                     cleanup = False
                 return None
 
@@ -16678,7 +16678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         home.chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
-                    if getattr(result, "retryable", False):
+                    if self._lifecycle_send_failure_should_retry(result):
                         retryable_pending = True
                     continue
 
