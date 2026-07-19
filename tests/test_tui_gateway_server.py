@@ -10060,8 +10060,8 @@ def test_attach_worker_stores_worker_on_live_session():
 
 def test_restart_slash_worker_closes_orphan_when_session_reaped(monkeypatch):
     """Post-turn restart of a session reaped mid-flight (e.g. close_on_disconnect
-    fired while `running` flipped false) must close both the stale worker and
-    the fresh replacement, not orphan either."""
+    fired while `running` flipped false) must close the stale worker without
+    constructing a replacement for a session that is already gone."""
     closed = []
 
     class _FakeWorker:
@@ -10078,9 +10078,8 @@ def test_restart_slash_worker_closes_orphan_when_session_reaped(monkeypatch):
     reaped = {"session_key": "k", "slash_worker": _FakeWorker()}
     server._restart_slash_worker("reaped", reaped)
 
-    # stale worker closed by the restart, fresh worker closed by _attach_worker
-    # (sid no longer maps to this session)
-    assert closed == [True, True]
+    assert closed == [True]
+    assert reaped["slash_worker"] is None
     assert "reaped" not in server._sessions
 
 
@@ -10126,6 +10125,121 @@ def test_restart_slash_worker_noop_without_worker(monkeypatch):
         assert live["slash_worker"] is None
     finally:
         server._sessions.pop("lazy-noop", None)
+
+
+def test_slash_exec_concurrent_first_use_constructs_one_worker(monkeypatch):
+    """Concurrent first-use RPCs must share one worker/MCP fleet."""
+    created = []
+    start = threading.Barrier(2)
+    responses = {}
+
+    class _FakeWorker:
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            # Widen the pre-attach window so both handlers observe None when
+            # construction is not serialized.
+            time.sleep(0.05)
+
+        def run(self, cmd):
+            return cmd
+
+        def close(self):
+            pass
+
+    sid = "lazy-concurrent-first-use"
+    session = {
+        "session_key": "stored-key",
+        "agent": types.SimpleNamespace(model="session-model"),
+        "slash_worker": None,
+    }
+    server._sessions[sid] = session
+
+    def _invoke(rid):
+        start.wait(timeout=2)
+        responses[rid] = server._methods["slash.exec"](
+            rid, {"session_id": sid, "command": "journey"}
+        )
+
+    monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+    monkeypatch.setattr(server, "_mirror_slash_side_effects", lambda *args: "")
+    monkeypatch.setattr("hermes_cli.commands.resolve_command", lambda _cmd: "journey")
+    monkeypatch.setattr("agent.skill_commands.get_skill_commands", lambda: {})
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_command_handler", lambda _cmd: None)
+
+    threads = [threading.Thread(target=_invoke, args=(f"r{i}",)) for i in (1, 2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert sorted(responses) == ["r1", "r2"]
+        assert all("result" in response for response in responses.values())
+        assert len(created) == 1
+        assert session["slash_worker"] is created[0]
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize(
+    ("session_fields", "expected_model"),
+    [
+        ({"model_override": {"model": "new-chat-model"}}, "new-chat-model"),
+        (
+            {
+                "resume_runtime_overrides": {
+                    "model_override": {"model": "resumed-model"}
+                }
+            },
+            "resumed-model",
+        ),
+    ],
+)
+def test_slash_exec_before_agent_build_uses_session_model(
+    monkeypatch, session_fields, expected_model
+):
+    """A pre-build slash command must not fall back to the launch profile model."""
+    captured = {}
+
+    class _FakeWorker:
+        def __init__(self, key, model, profile_home=None):
+            captured.update(key=key, model=model, profile_home=profile_home)
+
+        def run(self, cmd):
+            return cmd
+
+        def close(self):
+            pass
+
+    sid = f"lazy-prebuild-{expected_model}"
+    session = {
+        "session_key": "stored-key",
+        "agent": None,
+        "profile_home": "/profiles/review",
+        "slash_worker": None,
+        **session_fields,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "launch-profile-model")
+    monkeypatch.setattr(server, "_mirror_slash_side_effects", lambda *args: "")
+    monkeypatch.setattr("hermes_cli.commands.resolve_command", lambda _cmd: "journey")
+    monkeypatch.setattr("agent.skill_commands.get_skill_commands", lambda: {})
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_command_handler", lambda _cmd: None)
+
+    try:
+        response = server._methods["slash.exec"](
+            "r1", {"session_id": sid, "command": "journey"}
+        )
+        assert "result" in response
+        assert captured == {
+            "key": "stored-key",
+            "model": expected_model,
+            "profile_home": "/profiles/review",
+        }
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_session_close_rpc_claims_then_tears_down(monkeypatch):

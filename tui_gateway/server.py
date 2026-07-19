@@ -738,15 +738,61 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     # finalize is unregistering the notifier and closing the in-process agent.
 
 
-def _attach_worker(sid: str, session: dict, worker) -> None:
+def _attach_worker(sid: str, session: dict, worker) -> bool:
     """Store worker on session iff sid still maps to it, else close it — a
     concurrent teardown already popped the session and would orphan the
     worker. Closes the create/close race at every slash-worker spawn site."""
     with _sessions_lock:
         if _sessions.get(sid) is session:
             session["slash_worker"] = worker
-            return
+            return True
     worker.close()
+    return False
+
+
+def _session_slash_worker_lock(sid: str, session: dict):
+    """Return the live session's per-worker lock, or None after teardown."""
+    with _sessions_lock:
+        if _sessions.get(sid) is not session:
+            return None
+        lock = session.get("slash_worker_lock")
+        if lock is None:
+            # slash.exec is dispatched through a thread pool. Serialize both
+            # first construction and the request/response pipe for this one
+            # subprocess; RLock permits same-thread side-effect mirroring to
+            # restart the worker after model/compression changes.
+            lock = threading.RLock()
+            session["slash_worker_lock"] = lock
+        return lock
+
+
+def _session_slash_worker_model(session: dict) -> str:
+    """Resolve the model a lazy worker must use before or after agent build."""
+    agent_model = str(getattr(session.get("agent"), "model", "") or "").strip()
+    if agent_model:
+        return agent_model
+
+    runtime_overrides = session.get("resume_runtime_overrides")
+    candidates = []
+    if isinstance(runtime_overrides, dict):
+        candidates.append(runtime_overrides.get("model_override"))
+    candidates.append(session.get("model_override"))
+    for override in candidates:
+        if isinstance(override, dict):
+            model = str(override.get("model") or "").strip()
+        else:
+            model = str(override or "").strip()
+        if model:
+            return model
+
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        return _resolve_model()
+    token = set_hermes_home_override(profile_home)
+    try:
+        return _resolve_model()
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _pop_session_by_id(sid: str) -> dict | None:
@@ -3091,31 +3137,45 @@ def _tool_progress_enabled(sid: str) -> bool:
 
 
 def _restart_slash_worker(sid: str, session: dict):
-    worker = session.get("slash_worker")
-    # A session that never spawned a worker has nothing stale to replace —
-    # the next slash.exec builds one with the current session key/model.
-    # Spawning here would fork the per-worker stdio MCP fleet for sessions
-    # that never use worker-routed commands.
-    if worker is None:
+    lock = _session_slash_worker_lock(sid, session)
+    if lock is None:
+        # Teardown already detached this record. Close any stale worker still
+        # visible on the record, but do not construct a replacement that can
+        # only be discarded. _SlashWorker.close() is idempotent.
+        worker = session.get("slash_worker")
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+            session["slash_worker"] = None
         return
-    try:
-        worker.close()
-    except Exception:
-        pass
-    try:
-        new_worker = _SlashWorker(
-            session["session_key"],
-            getattr(session.get("agent"), "model", _resolve_model()),
-            profile_home=session.get("profile_home"),
-        )
-    except Exception:
-        session["slash_worker"] = None
-        return
-    # Route through the same store-iff-still-mapped guard as the spawn sites:
-    # the post-turn restart runs as `running` flips false, exactly when a
-    # close_on_disconnect reap can pop this session — a bare store would orphan
-    # the fresh worker (it self-heals only on gateway exit via the watchdog).
-    _attach_worker(sid, session, new_worker)
+    with lock:
+        worker = session.get("slash_worker")
+        # A session that never spawned a worker has nothing stale to replace —
+        # the next slash.exec builds one with the current session key/model.
+        # Spawning here would fork the per-worker stdio MCP fleet for sessions
+        # that never use worker-routed commands.
+        if worker is None:
+            return
+        try:
+            worker.close()
+        except Exception:
+            pass
+        try:
+            new_worker = _SlashWorker(
+                session["session_key"],
+                _session_slash_worker_model(session),
+                profile_home=session.get("profile_home"),
+            )
+        except Exception:
+            session["slash_worker"] = None
+            return
+        # Route through the same store-iff-still-mapped guard as the spawn sites:
+        # the post-turn restart runs as `running` flips false, exactly when a
+        # close_on_disconnect reap can pop this session — a bare store would orphan
+        # the fresh worker (it self-heals only on gateway exit via the watchdog).
+        _attach_worker(sid, session, new_worker)
 
 
 def _persist_model_switch(result) -> None:
@@ -14711,6 +14771,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if session is None:
+        return _err(rid, 4001, "session not found")
 
     cmd = params.get("command", "").strip()
     if not cmd:
@@ -14807,32 +14869,44 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
 
-    worker = session.get("slash_worker")
-    if not worker:
-        try:
-            worker = _SlashWorker(
-                session["session_key"],
-                getattr(session.get("agent"), "model", _resolve_model()),
-                profile_home=session.get("profile_home"),
-            )
-            _attach_worker(params.get("session_id", ""), session, worker)
-        except Exception as e:
-            return _err(rid, 5030, f"slash worker start failed: {e}")
+    sid = params.get("session_id", "")
+    lock = _session_slash_worker_lock(sid, session)
+    if lock is None:
+        return _err(rid, 4001, "session not found")
+    with lock:
+        with _sessions_lock:
+            if _sessions.get(sid) is not session:
+                return _err(rid, 4001, "session not found")
 
-    try:
-        output = worker.run(cmd)
-        warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
-        payload = {"output": output or "(no output)"}
-        if warning:
-            payload["warning"] = warning
-        return _ok(rid, payload)
-    except Exception as e:
+        worker = session.get("slash_worker")
+        if not worker:
+            try:
+                worker = _SlashWorker(
+                    session["session_key"],
+                    _session_slash_worker_model(session),
+                    profile_home=session.get("profile_home"),
+                )
+                if not _attach_worker(sid, session, worker):
+                    return _err(rid, 4001, "session not found")
+            except Exception as e:
+                return _err(rid, 5030, f"slash worker start failed: {e}")
+
         try:
-            worker.close()
-        except Exception:
-            pass
-        session["slash_worker"] = None
-        return _err(rid, 5030, str(e))
+            output = worker.run(cmd)
+            warning = _mirror_slash_side_effects(sid, session, cmd)
+            payload = {"output": output or "(no output)"}
+            if warning:
+                payload["warning"] = warning
+            return _ok(rid, payload)
+        except Exception as e:
+            try:
+                worker.close()
+            except Exception:
+                pass
+            with _sessions_lock:
+                if session.get("slash_worker") is worker:
+                    session["slash_worker"] = None
+            return _err(rid, 5030, str(e))
 
 
 # ── Methods: voice ───────────────────────────────────────────────────
