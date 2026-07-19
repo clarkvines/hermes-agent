@@ -572,7 +572,12 @@ class _DelayedUpdateSendAdapter(RestartTestAdapter):
 
 
 class _NeverReadyUpdateAdapter(RestartTestAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wait_calls = 0
+
     async def wait_until_send_ready(self):
+        self.wait_calls += 1
         return False
 
 
@@ -727,6 +732,37 @@ class TestSendUpdateNotification:
         assert pending_path.exists()
         assert not (hermes_home / ".update_pending.claimed.json").exists()
         assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_streaming_watcher_does_not_bypass_send_readiness(self, tmp_path):
+        """The progress watcher must not race its direct sends past readiness."""
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        adapter = _NeverReadyUpdateAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=0.001,
+                timeout=0.01,
+            )
+
+        assert adapter.wait_calls >= 1
+        assert adapter.sent == []
+        assert pending_path.exists()
+        assert (hermes_home / ".update_output.txt").exists()
+        assert (hermes_home / ".update_exit_code").exists()
 
     @pytest.mark.asyncio
     async def test_cancellation_during_readiness_wait_preserves_update_markers(

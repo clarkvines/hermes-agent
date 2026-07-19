@@ -15932,8 +15932,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+        # A reconnected adapter can exist before its transport is ready for
+        # outbound lifecycle traffic. Honor the same optional readiness
+        # contract as the completion-only path before this watcher streams
+        # output, forwards prompts, or sends final status directly. If the
+        # bounded wait fails, reuse the durable completion-only retry loop so
+        # markers remain authoritative instead of racing a degraded send.
+        if adapter and chat_id and not await _wait_for_adapter_send_ready(adapter):
+            logger.info(
+                "Update watcher: %s send path not ready, falling back to completion-only",
+                platform_str,
+            )
+            adapter = None
+
         if not adapter or not chat_id:
-            logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
+            logger.warning("Update watcher: cannot resolve ready adapter/chat_id, falling back to completion-only")
             # Fall back to completion-only: wait for the exit code and send the
             # final notification. _send_update_notification re-resolves the
             # adapter on every call, so when the target platform is still
