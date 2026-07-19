@@ -16195,11 +16195,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             # Readiness is tied to the adapter's current reconnect generation.
-            # Recheck every poll so a transient startup timeout neither races a
-            # send nor permanently disables prompt forwarding after recovery.
-            if not await _wait_for_adapter_send_ready(adapter):
+            # Resolve again after the await so replacement adapter B, not stale
+            # adapter A, owns streamed output and interactive prompt delivery.
+            adapter = await self._resolve_ready_lifecycle_adapter(platform)
+            if adapter is None:
                 await asyncio.sleep(poll_interval)
                 continue
+            metadata = self._thread_metadata_for_target(
+                platform,
+                chat_id,
+                thread_id,
+                chat_type=chat_type,
+                reply_to_message_id=message_id,
+                adapter=adapter,
+            )
 
             # Check for completion. The durable completion sender owns marker
             # claiming, SendResult validation, retry, and cleanup.

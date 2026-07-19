@@ -909,16 +909,14 @@ class TestSendUpdateNotification:
             "prompt": "Continue?",
             "default": "yes",
         }))
-        stale_adapter = _NeverReadyUpdateAdapter()
+        stale_adapter = _BlockingUpdateSendAdapter()
         replacement_adapter = _DelayedUpdateSendAdapter()
         runner.adapters = {Platform.TELEGRAM: stale_adapter}
 
         async def _replace_and_finish():
-            for _ in range(50):
-                if stale_adapter.wait_calls:
-                    break
-                await asyncio.sleep(0.001)
+            await asyncio.wait_for(stale_adapter.wait_started.wait(), timeout=1)
             runner.adapters[Platform.TELEGRAM] = replacement_adapter
+            stale_adapter.release.set()
             for _ in range(50):
                 if runner._update_prompt_pending.get("telegram:67890"):
                     break
