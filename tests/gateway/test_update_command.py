@@ -1162,8 +1162,8 @@ class TestSendUpdateNotification:
         assert not exit_code_path.exists()
 
     @pytest.mark.asyncio
-    async def test_cleans_up_on_error(self, tmp_path):
-        """Files are cleaned up even if notification fails."""
+    async def test_preserves_markers_when_send_raises(self, tmp_path):
+        """A transient adapter exception keeps the durable retry evidence."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -1183,12 +1183,13 @@ class TestSendUpdateNotification:
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
-            await runner._send_update_notification()
+            result = await runner._send_update_notification()
 
-        # Files should still be cleaned up (finally block)
-        assert not pending_path.exists()
-        assert not output_path.exists()
-        assert not exit_code_path.exists()
+        assert result is False
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
 
     @pytest.mark.asyncio
     async def test_handles_corrupt_pending_file(self, tmp_path):

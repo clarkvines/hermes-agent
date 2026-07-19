@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import HomeChannel, Platform
+from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
@@ -322,6 +322,18 @@ class _ToggleReadyRestartAdapter(RestartTestAdapter):
     async def wait_until_send_ready(self):
         self.first_attempt.set()
         return self.ready
+
+
+class _BlockingReadyRestartAdapter(RestartTestAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wait_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait_until_send_ready(self):
+        self.wait_started.set()
+        await self.release.wait()
+        return True
 
 
 @pytest.mark.asyncio
@@ -686,6 +698,47 @@ async def test_planned_home_missing_enabled_adapter_is_retryable(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_planned_home_persists_each_success_before_next_target_wait(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_pending.json"
+    marker.write_text("{}")
+    runner, telegram_adapter = make_restart_runner()
+    slack_adapter = _BlockingReadyRestartAdapter()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="telegram-home",
+        name="Telegram Home",
+    )
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(
+        enabled=True,
+        token="test",
+    )
+    runner.config.platforms[Platform.SLACK].home_channel = HomeChannel(
+        platform=Platform.SLACK,
+        chat_id="slack-home",
+        name="Slack Home",
+    )
+    runner.adapters = {
+        Platform.TELEGRAM: telegram_adapter,
+        Platform.SLACK: slack_adapter,
+    }
+
+    attempt = asyncio.create_task(
+        runner._attempt_home_channel_startup_notifications()
+    )
+    await slack_adapter.wait_started.wait()
+    attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+
+    persisted = gateway_run._planned_restart_delivered_targets()
+    assert persisted == {("telegram", "telegram-home", None)}
+    assert telegram_adapter.sent == ["♻️ Gateway online — Hermes is back and ready."]
+
+
+@pytest.mark.asyncio
 async def test_planned_home_retry_uses_persisted_delivered_targets(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     marker = tmp_path / ".restart_pending.json"
@@ -710,10 +763,10 @@ async def test_planned_home_retry_uses_persisted_delivered_targets(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_cleans_up_on_send_failure(
+async def test_send_restart_notification_preserves_marker_when_send_raises(
     tmp_path, monkeypatch
 ):
-    """If the adapter.send() raises, the file is still cleaned up."""
+    """A transient adapter exception keeps the durable restart receipt."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
@@ -727,9 +780,8 @@ async def test_send_restart_notification_cleans_up_on_send_failure(
 
     delivered_target = await runner._send_restart_notification()
 
-    # File cleaned up even though send raised.
     assert delivered_target is None
-    assert not notify_path.exists()
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio

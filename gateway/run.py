@@ -16254,10 +16254,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _flush_buffer()
                         # Try platform-native buttons first (Discord, Telegram)
                         sent_buttons = False
-                        prompt_sender: Any = getattr(adapter, "send_update_prompt", None)
+                        prompt_sender: Any = getattr(
+                            type(adapter), "send_update_prompt", None
+                        )
                         if callable(prompt_sender):
                             try:
                                 prompt_result = await prompt_sender(
+                                    adapter,
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
@@ -16425,11 +16428,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                result = await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
+                try:
+                    result = await adapter.send(
+                        chat_id,
+                        msg,
+                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Post-update notification to %s:%s raised; deferring: %s",
+                        platform_str,
+                        chat_id,
+                        exc,
+                    )
+                    cleanup = False
+                    active_pending_path = pending_path
+                    claimed_path.replace(pending_path)
+                    return False
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Post-update notification to %s:%s was not delivered: %s",
@@ -16522,11 +16539,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=message_id,
                 adapter=adapter,
             )
-            result = await adapter.send(
-                str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
-                metadata=_non_conversational_metadata(metadata, platform=platform),
-            )
+            try:
+                result = await adapter.send(
+                    str(chat_id),
+                    "♻ Gateway restarted successfully. Your session continues.",
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                cleanup = False
+                logger.warning(
+                    "Restart notification to %s:%s raised; deferring: %s",
+                    platform_str,
+                    chat_id,
+                    exc,
+                )
+                return None
             # adapter.send() catches provider errors (e.g. "Chat not found")
             # and returns SendResult(success=False) rather than raising, so
             # we must inspect the result before claiming success — otherwise
@@ -16641,6 +16670,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 delivered.add(target)
+                if _planned_restart_notification_pending():
+                    _record_planned_restart_delivered_targets(
+                        _planned_restart_delivered_targets() | delivered
+                    )
                 logger.info(
                     "Sent home-channel startup notification to %s:%s",
                     platform.value,
