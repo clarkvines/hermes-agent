@@ -8994,6 +8994,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            # Lifecycle retry tasks may currently be inside adapter readiness
+            # or send calls. Cancel and await them while adapters are still
+            # connected so cancellation-safe marker restoration completes
+            # before teardown, and no stale "online" send races shutdown.
+            await self._cancel_lifecycle_notification_watchers()
+
             timeout = self._restart_drain_timeout
 
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
@@ -15888,6 +15894,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             logger.debug("Skipping restart notification watcher: no running event loop")
 
+    async def _cancel_lifecycle_notification_watchers(self) -> None:
+        """Cancel and reap lifecycle senders before adapters begin teardown.
+
+        These watchers can be blocked in adapter readiness or send calls.  A
+        bare cancellation without awaiting their cleanup lets their marker
+        restoration and send-finally paths race adapter disconnect (or even the
+        replacement gateway process).  Keep the set explicit rather than
+        cancelling every background task here: normal agent/cron drain owns
+        the rest of the gateway's background work.
+        """
+        current_task = asyncio.current_task()
+        tasks: list[asyncio.Task] = []
+        for attr in (
+            "_restart_notification_task",
+            "_update_notification_task",
+            "_home_startup_notification_task",
+        ):
+            task = getattr(self, attr, None)
+            if task is None or task is current_task or task.done():
+                continue
+            task.cancel()
+            tasks.append(task)
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    logger.warning(
+                        "Lifecycle notification watcher failed during shutdown: %s",
+                        result,
+                    )
+
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is not None:
+            background_tasks.difference_update(tasks)
+
+        for attr in (
+            "_restart_notification_task",
+            "_update_notification_task",
+            "_home_startup_notification_task",
+        ):
+            task = getattr(self, attr, None)
+            if task in tasks or (task is not None and task.done()):
+                setattr(self, attr, None)
+
     async def _watch_restart_notification(
         self,
         poll_interval: float = 2.0,
@@ -16109,6 +16162,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Update stream send failed: %s", e)
 
         while loop.time() < deadline:
+            # The reconnect watcher replaces adapter instances. Never keep
+            # polling a torn-down generation: rebind to the current instance
+            # (or wait while it is absent) and rebuild target metadata.
+            current_adapter = self.adapters.get(platform)
+            if current_adapter is not adapter:
+                adapter = current_adapter
+                if adapter is not None:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        chat_id,
+                        thread_id,
+                        chat_type=chat_type,
+                        reply_to_message_id=message_id,
+                        adapter=adapter,
+                    )
+            if adapter is None:
+                await asyncio.sleep(poll_interval)
+                continue
+
             # Readiness is tied to the adapter's current reconnect generation.
             # Recheck every poll so a transient startup timeout neither races a
             # send nor permanently disables prompt forwarding after recovery.

@@ -139,6 +139,38 @@ async def test_gateway_stop_cancels_secondary_reconnects_before_session_drain():
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_awaits_lifecycle_watchers_before_adapter_disconnect():
+    runner, adapter = make_restart_runner()
+    order: list[str] = []
+    started = asyncio.Event()
+
+    async def _lifecycle_watcher() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("lifecycle_cancelled")
+
+    lifecycle_task = asyncio.create_task(_lifecycle_watcher())
+    runner._update_notification_task = lifecycle_task
+    runner._background_tasks.add(lifecycle_task)
+    lifecycle_task.add_done_callback(runner._background_tasks.discard)
+
+    async def _disconnect() -> None:
+        order.append("disconnect")
+
+    adapter.disconnect = _disconnect
+    await started.wait()
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+    await asyncio.sleep(0)
+
+    assert lifecycle_task.done()
+    assert order.index("lifecycle_cancelled") < order.index("disconnect")
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_interrupts_after_drain_timeout():
     runner, adapter = make_restart_runner()
     runner._restart_drain_timeout = 0.05
